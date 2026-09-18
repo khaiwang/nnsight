@@ -236,6 +236,7 @@ class Requests:
                     for name, value in template.lcls.items()
                 }
                 copy = Mediator(template.code, template.glbls, scope)
+                copy.source = template.source
                 copy.presaved = set(template.presaved)
                 request.copies[registration_id] = copy
             if "nnsight_mediator" in extra_args:
