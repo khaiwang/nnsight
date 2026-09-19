@@ -16,16 +16,15 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import io
 import logging
 import uuid
 import warnings
 from typing import TYPE_CHECKING, Any, Optional
 
-import torch
 from fastapi import FastAPI, HTTPException, Request, Response
 
 from ..engines.engine import acollect
+from ..wire import frame, pack
 
 if TYPE_CHECKING:
     from ..vllm import VLLM
@@ -44,10 +43,9 @@ _cleanups: set = set()
 
 
 def _payload(saves: dict, error: Optional[dict]) -> Response:
-    """A generate response: torch.save of ``{"saves": {...}, "error": <deferred>}``."""
-    buffer = io.BytesIO()
-    torch.save({"saves": saves, "error": error}, buffer)
-    return Response(content=buffer.getvalue(), media_type="application/octet-stream")
+    """A generate response: ``{"saves": {...}, "error": <deferred>}`` as a wire frame."""
+    return Response(content=frame(*pack({"saves": saves, "error": error})),
+                    media_type="application/octet-stream")
 
 
 def set_model(model: "VLLM") -> None:
@@ -153,7 +151,7 @@ async def clear_registration(registration_id: str) -> dict:
 async def generate(request: Request) -> Response:
     """Run a serialized trace and return its saved values.
 
-    Body: ``RequestModel.serialize(tracer)`` bytes. Response: ``torch.save`` of
+    Body: ``RequestModel.serialize(tracer)`` bytes. Response: a ``wire.frame`` of
     ``{"saves": {name: value}, "error": <deferred error or None>}`` — saved values
     only, so read generated tokens by saving ``tracer.result``, which is served here
     like anywhere else. A build error (a corrupt/incompatible trace) or a runtime

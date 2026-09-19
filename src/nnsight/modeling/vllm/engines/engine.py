@@ -18,6 +18,8 @@ from typing import Any, Optional
 
 from vllm.v1.engine.llm_engine import LLMEngine
 
+from ..wire import unpack
+
 
 def merge_collected(payloads: list) -> dict:
     """Combine what each rank returned from ``collect_nnsight``.
@@ -32,12 +34,16 @@ def merge_collected(payloads: list) -> dict:
     rank's wins. They are equal, but they are on different devices, and a value
     whose device depended on which rank answered last would be a confusing thing
     to hand back next to a traced one.
+
+    Each payload is the wire form of [`pack`][nnsight.modeling.vllm.wire.pack]:
+    the structure pickled with slots where its tensors were, and the tensors as
+    byte strings, which msgpack carries in either serialization mode.
     """
     merged: dict[str, dict] = {}
     for payload in payloads or ():
         if payload is None:
             continue
-        for request_id, entry in pickle.loads(payload).items():
+        for request_id, entry in unpack(payload["meta"], payload["buffers"]).items():
             into = merged.setdefault(
                 request_id,
                 {"saves": {}, "error": None, "registered": {}, "sequences": {}},

@@ -198,7 +198,7 @@ the earliest rank's is kept, so the value lands on the device a traced one would
 
 `collect_nnsight(request_ids, finished_request_ids, outputs=None)` runs on the
 worker and returns
-`pickle.dumps({engine_id: {"saves", "registered", "error", "sequences"}})`.
+`pack({engine_id: {"saves", "registered", "error", "sequences"}})` from `wire.py`: the structure pickled with a slot where each tensor was, plus each tensor's bytes, owning only its own elements, which msgpack carries natively in either serialization mode.
 `sequences` is keyed by sampled-sequence index: `n > 1` fans a request into a child
 per sequence (`"{index}_{parent}"`, vLLM's `ParentRequest`), each of which runs its
 own copy of the block, so each is owed values of its own. A `Request` parses its
@@ -342,7 +342,7 @@ the meta model, and a server holds one dispatched async `VLLM`.
   `RequestModel.serialize(tracer)` blob, `_build_tracer` deserializes it
   (`RequestModel.deserialize`, plus restoring `tracer.node`), calls `prepare` +
   `_attach_mediators`, runs each invoke through the engine, collects saves via
-  `collect_nnsight`, and `torch.save`s `{"saves", "error"}` back (saved values only;
+  `collect_nnsight`, and sends `{"saves", "error"}` back as a `wire.frame` (the pickled structure, then each tensor's raw bytes) (saved values only;
   a build or runtime error rides `error` with its real type + traceback). Worker
   building is synchronous (all before the first `await`), so concurrent requests
   never interleave on the shared interleaver. `POST /v1/nnsight/register/{id}` and
@@ -352,7 +352,7 @@ the meta model, and a server holds one dispatched async `VLLM`.
 - `serve/http.py` — the headers, timeouts, and non-200 handling both client halves
   share: `LocalServeBackend` sending a trace and `ServeRegistration` sending a block.
 - `serve/backend.py` — `LocalServeBackend(Backend)`, the client side of `serve=url`:
-  serializes the trace, POSTs it, `torch.load`s the result, `raise_deferred`s any
+  serializes the trace, POSTs it, `unframe`s the result into CPU views, `raise_deferred`s any
   error, `mark`s the saves, and `push`es them into the caller's frame — so reading a
   `.save()`d variable after the block works exactly as locally.
 

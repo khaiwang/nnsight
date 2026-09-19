@@ -39,7 +39,7 @@ class NNsightGPUWorker(Worker):
         request_ids: list[str],
         finished_request_ids: Optional[list[str]] = None,
         outputs: Optional[Any] = None,
-    ) -> Optional[bytes]:
+    ) -> Optional[dict]:
         """Return this worker's saved values, as ``collective_rpc`` reaches it here.
 
         ``outputs`` arrives pickled (see ``NNsightLLMEngine.step``): the RPC is

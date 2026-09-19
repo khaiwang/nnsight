@@ -12,7 +12,7 @@ a local run would, so reading a ``.save()``d value after the block just works::
     logits                                                     # pushed back here
 
 ``api_key`` (optional) is sent as the ``ndif-api-key`` header. The server's response
-is a ``torch.save`` of ``{"saves": {name: value}, "error": <deferred or None>}`` —
+is a ``wire.frame`` of ``{"saves": {name: value}, "error": <deferred or None>}`` —
 saved values only, so read generated tokens by saving ``tracer.result``. A build or
 runtime error comes back as ``error`` and is re-raised at the client with its real type and traceback; a
 transport/service failure (e.g. the engine not ready) surfaces as ``ConnectionError``.
@@ -20,10 +20,8 @@ transport/service failure (e.g. the engine not ready) surfaces as ``ConnectionEr
 
 from __future__ import annotations
 
-import io
 from typing import TYPE_CHECKING, Any, Optional
 
-import torch
 
 from ....tracing.backend import Backend
 
@@ -51,6 +49,7 @@ class LocalServeBackend(Backend):
 
         from ....intervention.errors import raise_deferred
         from . import http
+        from ..wire import unframe
 
         with httpx.Client(timeout=http.timeout()) as client:
             response = client.post(
@@ -60,9 +59,9 @@ class LocalServeBackend(Backend):
             )
         http.check(response)
 
-        result = torch.load(
-            io.BytesIO(response.content), map_location="cpu", weights_only=False
-        )
+        # A bytearray, so the tensors cut from it are writable views; on CPU, as
+        # a served value has no device of the caller's.
+        result = unframe(bytearray(response.content), device="cpu")
         # A real intervention error on the server comes back as a deferred error;
         # re-raise it here (a tracer.stop() is control flow and stays silent).
         raise_deferred(result.get("error"))

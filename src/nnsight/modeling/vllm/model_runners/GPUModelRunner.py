@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import re
 
-import pickle
 import warnings
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -39,6 +38,7 @@ from ....intervention.interleaver import Mediator
 from ....intervention.serialization import loads
 from ....tracing.tracer import _local, _saves, inc
 from ..batching import VLLMBatcher
+from ..wire import pack, raw
 from ..fragments import VLLMFragments
 from ..interleaver import VLLMInterleaver
 
@@ -730,7 +730,7 @@ class NNsightGPUModelRunner(GPUModelRunner):
         request_ids: list[str],
         finished_request_ids: Optional[list[str]] = None,
         outputs: Optional[dict] = None,
-    ) -> Optional[bytes]:
+    ) -> Optional[dict]:
         """Return the saved values and any deferred error of the named requests.
 
         Keyed per request rather than merged, so two traces that happen to name a
@@ -842,11 +842,10 @@ class NNsightGPUModelRunner(GPUModelRunner):
             if primary is not None:
                 entry["saves"], entry["registered"] = primary["saves"], primary["registered"]
 
-        # Saves may still be device work in flight; they are about to be pickled.
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-
-        return pickle.dumps(collected)
+        # Tensors leave as byte strings, each owning only its elements; pack
+        # copies them off the device and waits for those copies itself.
+        meta, buffers = pack(collected)
+        return {"meta": meta, "buffers": raw(buffers)}
 
     # ------------------------------------------------------------------
     # Worker-side RPC entry points (called by name via collective_rpc)
