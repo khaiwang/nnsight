@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import re
 import warnings
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 from vllm import envs
@@ -149,9 +149,14 @@ class Requests:
             A request that names the edits it wants (``extra_args["nnsight_edits"]``)
             gets copies of those and of every unnamed one; a request that names
             none gets copies of them all.
+        release: Called with a request's id when it stops being tracked (see
+            `retire`), for what the runner keeps per request outside this table:
+            a pipeline stage's round counts and link state. ``None`` when there
+            is nothing else to let go of.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, release: Optional[Callable[[str], None]] = None) -> None:
+        self.release = release
         self.requests: dict[str, Request] = {}
         self.templates: dict[str, Any] = {}
         self.names: dict[str, str | None] = {}
@@ -404,7 +409,15 @@ class Requests:
         # it, so it is dropped here, off the scheduler.
         for request in list(self.requests.values()):
             if request.named(finished) and request.mediator is None and request.error is None and not request.harvested:
-                del self.requests[request.id]
+                self.retire(request.id)
+
+    def retire(self, request_id: str) -> None:
+        """Stop tracking a request, and let go of whatever else the engine keeps
+        under its id. The one way a request leaves, so nothing held for it is
+        left behind by whichever path saw it finish."""
+        del self.requests[request_id]
+        if self.release is not None:
+            self.release(request_id)
 
     def serve_result(self, mediator: Any, output: Any) -> None:
         """Hand a finished request's output to a worker parked on ``tracer.result``.
@@ -540,7 +553,7 @@ class NNsightGPUModelRunner(GPUModelRunner):
         # every other request shares.
         interleaver.defer_exceptions = True
 
-        self.nnsight_requests = Requests()
+        self.nnsight_requests = Requests(release=interleaver.finished if self.nnsight_pp else None)
         self._pipeline_scheduled: list = []
         # The map that resolves a serialized request's persistent ids (the interleaver,
         # every module, the tokenizer) back to this worker's objects. The tree is fixed
@@ -604,21 +617,25 @@ class NNsightGPUModelRunner(GPUModelRunner):
         return PPInterleaver(module_map, link, local, device, taps=taps, fragments=VLLMFragments()), meta_model
 
     def _replicate_heads(self, interleaver: Any, meta_model: torch.nn.Module) -> None:
-        """Fetch the language-model head's weight onto every stage that does
+        """Fetch the language-model head's state onto every stage that does
         not hold it, once, at load.
 
         It is the one large weight blocks read across stages (1.45 GiB and
         3 s per fetch at 14B), and it is the same for every request, so it is
         kept for the engine's life; fetched here, inside ``load_model``, it is
-        counted when vLLM measures memory and sizes its KV cache. A model
-        whose head is tied to its embedding holds the weight on every stage
-        already and has no shell for it, so nothing is fetched. Every other
-        fetched value lives only as long as the requests that use it.
+        counted when vLLM measures memory and sizes its KV cache. The whole
+        state is fetched rather than a parameter by name, because what the
+        head holds depends on the checkpoint: ``weight`` when unquantized,
+        ``qweight`` and ``scales`` (and more) when its quantization covers the
+        head. ``param(name)`` is then answered from it. A model whose head is
+        tied to its embedding holds the weight on every stage already and has
+        no shell for it, so nothing is fetched. Every other fetched value lives
+        only as long as the requests that use it.
         """
         import torch.distributed as dist
         from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
-        from ..pp_envoys import PARAM_MARK, RemoteShell
+        from ..pp_envoys import STATE_MARK, RemoteShell
 
         # A request is answered by its owner's resolver; wait until every
         # stage has set one.
@@ -627,7 +644,7 @@ class NNsightGPUModelRunner(GPUModelRunner):
         root = interleaver.module_map.root_path
         for name, module in meta_model.named_modules():
             if isinstance(module, ParallelLMHead) and isinstance(local.get(name), RemoteShell):
-                local[name]._fetch(f"{root}.{name}{PARAM_MARK}weight")
+                local[name]._fetch(f"{root}.{name}{STATE_MARK}")
 
     def _reports_saves(self, mediator: Any) -> bool:
         """Whether this stage's copy of the block has to send its saved values home.
@@ -946,9 +963,7 @@ class NNsightGPUModelRunner(GPUModelRunner):
                 sequence["saves"] = request.saves() if self._reports_saves(mediator) else {}
             note(entry, request.deferred())
             if done and not request.copies:
-                requests.requests.pop(request.id, None)
-                if self.nnsight_pp:
-                    self.nnsight_model.interleaver.finished(request.id)
+                requests.retire(request.id)
         # A worker that sat out the step before its request ended is still in `out`,
         # holding its scope, until a next step that an idle engine never takes.
         requests.out = {mediator for mediator in requests.out if mediator.alive}
