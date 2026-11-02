@@ -31,7 +31,7 @@ def merge_saves(reports: list[dict]) -> dict:
     """
     from ....intervention.cache import Cache, CacheView
 
-    def cache_of(value: Any) -> Optional[Cache]:
+    def cache_of(value: Any) -> Cache | None:
         # tracer.cache() hands the block a CacheView over its Cache.
         if isinstance(value, CacheView):
             return value._cache
@@ -55,19 +55,23 @@ def merge_saves(reports: list[dict]) -> dict:
 
 
 def merge_collected(payloads: list) -> dict:
-    """Combine what each rank returned from ``collect_nnsight``.
+    """Combine the replies to ``collect_nnsight`` into one entry per request.
 
-    Every rank runs the block and reports what it saved, or nothing when it
-    has nothing only it holds (see the runner's ``_reports_saves``). Saves,
-    registered values and errors are taken the last rank's first
-    (`merge_saves`).
+    The first tensor-parallel rank of each pipeline stage replies, and the
+    other ranks reply ``None``: without pipeline parallelism that is one
+    reply, which this hands back as it is. Under it, the last stage's reply
+    carries every value the block read, and an earlier stage's carries what
+    only it holds, a cache that observed its own modules (see the runner's
+    ``_reports_saves``). Saves and registered values are taken the last
+    stage's first (`merge_saves`), and so is the error, a real one over a stop.
     """
+    replies = [pickle.loads(payload) for payload in payloads or () if payload is not None]
+    if len(replies) == 1:
+        return replies[0]
     merged: dict[str, dict] = {}
     reports: dict[str, dict] = {}
-    for payload in payloads or ():
-        if payload is None:
-            continue
-        for request_id, entry in pickle.loads(payload).items():
+    for reply in replies:
+        for request_id, entry in reply.items():
             into = merged.setdefault(
                 request_id,
                 {"saves": {}, "error": None, "registered": {}, "sequences": {}},
@@ -83,7 +87,8 @@ def merge_collected(payloads: list) -> dict:
                 per_index["registered"].append(sequence.get("registered") or {})
     for request_id, report in reports.items():
         into = merged[request_id]
-        into["error"] = next((error for error in reversed(report["errors"]) if error is not None), None)
+        errors = [error for error in reversed(report["errors"]) if error is not None]
+        into["error"] = next((error for error in errors if not error["is_control_flow"]), errors[0] if errors else None)
         into["saves"] = merge_saves(report["saves"])
         into["registered"] = merge_saves(report["registered"])
         for index, per_index in report["sequences"].items():
@@ -131,12 +136,13 @@ async def acollect(engine: Any, request_id: str, output: Any = None) -> dict | N
     and needs in order to serve ``tracer.result``; without one this is simply the
     call that winds the request's workers up and frees what they held. Every rank
     is called, since each has workers to wind up, but only the first
-    tensor-parallel rank replies with values; the rest reply ``None``.
+    tensor-parallel rank of each pipeline stage replies with values; the rest
+    reply ``None`` (see `merge_collected`).
     """
     ids = [request_id]
     args = (ids, ids) if output is None else (ids, ids, pickle.dumps({request_id: output}))
     replies = await engine.collective_rpc("collect_nnsight", args=args)
-    return pickle.loads(next(reply for reply in replies if reply is not None)).get(request_id)
+    return merge_collected(replies).get(request_id)
 
 
 class NNsightLLMEngine(LLMEngine):
@@ -165,8 +171,7 @@ class NNsightLLMEngine(LLMEngine):
         replies = self.engine_core.collective_rpc(
             "collect_nnsight", args=(finished, finished, pickle.dumps(by_id))
         )
-        # Only the first tensor-parallel rank replies with values (see `acollect`).
-        collected = pickle.loads(next(reply for reply in replies if reply is not None))
+        collected = merge_collected(replies)
         for output in outputs:
             entry = collected.get(output.request_id)
             if entry is not None:

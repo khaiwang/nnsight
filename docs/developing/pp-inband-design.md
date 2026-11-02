@@ -28,8 +28,7 @@ multiprocess and the Ray executor. Backward, the sampled token the last stage
 produces at step `s` reaches the first stage before its step `s+1`: under
 async scheduling by a broadcast on the pipeline group right after sampling
 (`gpu_model_runner.py`, `_pp_broadcast_prev_sampled_token_ids`), and under
-sync scheduling (the Ray executor) through the scheduler, in the next step's
-`SchedulerOutput`. A block's cross-stage values have exactly these two
+sync scheduling through the scheduler, in the next step's `SchedulerOutput`. A block's cross-stage values have exactly these two
 shapes, so they take the same carriers.
 
 ## The carriers
@@ -61,15 +60,17 @@ entries of the stages between as well, which the stages before them lack,
 but not the first stage's, which every later stage already got forward.
 A stage relays a copy taken when the entry arrived, since its own copy of
 the block may change the value it was handed in place. Under sync
-scheduling the
-stages before the last never run `sample_tokens`, so the last stage puts the
-same entries, on the host, on its `ModelRunnerOutput`; `NNsightScheduler`
+scheduling the sampled tokens reach the earlier stages through the scheduler,
+so the last stage puts the same entries, on the host, on its
+`ModelRunnerOutput`; `NNsightScheduler`
 (`pp_scheduler.py`) keeps them by request and attaches them to the request's
 next `SchedulerOutput`, which every stage reads before its forward. A request
 that finishes has no next step, and the scheduler drops what it left.
 Whether async scheduling is on is settled inside vLLM's config after the
-engine's arguments are read (it picks the Ray executor by itself inside a
-Ray placement group, and turns async scheduling off there), so nnsight does
+engine's arguments are read, and it differs by executor and release (vLLM
+0.19 picked its compiled-graph Ray executor by itself inside a Ray placement
+group and turned async scheduling off there; 0.27's Ray executor keeps it
+on, and nnsight refuses the compiled-graph one), so nnsight does
 not install a scheduler class directly: `scheduler_cls` replaces whatever
 vLLM would pick, its `AsyncScheduler` included. Every pipeline engine gets
 `pp_scheduler.pipeline_scheduler`, which the engine core calls once with the
@@ -128,9 +129,10 @@ step-stamped payload after sampling, on Qwen2.5-0.5B at PP=2:
   arrived on stage 0, each before any request of its step was executed
   again, with the same four requests scheduled on consecutive steps. That is
   the ordering vLLM's own token broadcast has, since the two sit side by side.
-- Ray executor: async scheduling reported off on both ranks; 9 forward
-  payloads arrived through the compiled graph's edge, as `IntermediateTensors`,
-  shapes varying per step.
+- Ray executor (vLLM 0.19's compiled-graph one, which nnsight now refuses):
+  async scheduling reported off on both ranks; 9 forward payloads arrived
+  through the compiled graph's edge, as `IntermediateTensors`, shapes varying
+  per step.
 
 After the change: the pipeline CPU tiers (transport codec, the two-rank
 harness over the reply wire with entries exchanged by the same rules, the

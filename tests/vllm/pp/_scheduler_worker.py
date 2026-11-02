@@ -6,7 +6,8 @@ Scenarios:
   default    no scheduling arguments: vLLM turns async scheduling on
   async_off  async_scheduling=False
   ray_auto   built inside a Ray actor in a placement group, with no backend
-             named: vLLM picks Ray itself and turns async scheduling off
+             named: vLLM picks Ray itself, and settles async scheduling itself
+  ray_sync   the same, with async_scheduling=False
 """
 
 import json
@@ -41,7 +42,7 @@ def build_and_run(extra):
     }
 
 
-def ray_auto():
+def ray_auto(extra):
     import ray
     from ray.util.placement_group import placement_group
     from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -53,7 +54,7 @@ def ray_auto():
     @ray.remote(num_cpus=1)
     class Builder:
         def run(self):
-            return build_and_run({})
+            return build_and_run(extra)
 
     builder = Builder.options(
         scheduling_strategy=PlacementGroupSchedulingStrategy(group, placement_group_capture_child_tasks=True),
@@ -71,8 +72,8 @@ if __name__ == "__main__":
     # Reads are the model's own buffers, so the in-place write reaches the model.
     # Set before Ray starts, so its workers get the same value.
     os.environ["NNSIGHT_VLLM_CLONE_READS"] = "0"
-    if scenario == "ray_auto":
-        result = ray_auto()
+    if scenario.startswith("ray_"):
+        result = ray_auto({"async_scheduling": False} if scenario == "ray_sync" else {})
     else:
         result = build_and_run({"async_scheduling": False} if scenario == "async_off" else {})
     print("RESULT " + json.dumps(result), flush=True)

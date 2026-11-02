@@ -4,16 +4,17 @@ Under pipeline parallelism a stage before the last needs, at a request's next
 step, the values the later stages served in this one. When the engine runs
 with async scheduling, the last stage broadcasts them to the other stages
 right after sampling, beside vLLM's own broadcast of the sampled tokens (see
-the runner). When it does not (the Ray executor, which returns the sampled
-tokens through the scheduler instead), the stages before the last never run
-that broadcast, so the values take the tokens' route: the last stage puts
-them on its output, this scheduler keeps them by request, and the request's
-next scheduler output carries them to every stage. A request that finishes
-has no next output, and what it left is dropped with it.
+the runner). When it does not, the scheduler waits for each step's sampled
+tokens and hands them to every stage in the next scheduler output, so the
+values take the tokens' route: the last stage puts them on its output, this
+scheduler keeps them by request, and the request's next scheduler output
+carries them to every stage. A request that finishes has no next output, and
+what it left is dropped with it.
 
 Whether async scheduling is on is settled inside vLLM's own config, after the
-engine's arguments are read: it turns it off for the Ray executor, which it
-may pick by itself (inside a Ray placement group), and for other reasons.
+engine's arguments are read, and differs by executor and release: vLLM 0.19
+turned it off for its Ray executor, which it may pick by itself inside a Ray
+placement group, while 0.27's Ray executor keeps it on.
 So the choice is made where that is settled and the scheduler is built:
 `pipeline_scheduler`, installed as ``scheduler_cls`` on every pipeline engine,
 reads the finished config and builds vLLM's own AsyncScheduler or this one.

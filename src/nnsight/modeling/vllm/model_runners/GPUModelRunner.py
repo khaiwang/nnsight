@@ -789,8 +789,7 @@ class NNsightGPUModelRunner(GPUModelRunner):
                 self._pipeline_announce_failures()
                 self._pipeline_scheduled = list(scheduled)
                 # A stage before the last has served everything it will for
-                # this step during its forward, and under the Ray executor
-                # it never runs sample_tokens, so its step closes here, and
+                # this step during its forward, so its step closes here, and
                 # what it served leaves with the activations.
                 if not get_pp_group().is_last_rank:
                     self._close_step()
@@ -842,12 +841,11 @@ class NNsightGPUModelRunner(GPUModelRunner):
         broadcast of the sampled tokens: the last stage broadcasts what it
         served this step and a mark per request that the step is done, and
         the earlier stages file it before their next forward, which is when a
-        worker parked on one of those values is resumed. Where the engine
-        returns the sampled tokens through the scheduler instead (the Ray
-        executor), the stages before the last never run this, so the last
-        stage puts the same entries on its output, on the host, and the
-        scheduler carries them to every stage with the request's next step
-        (see `pp_scheduler`).
+        worker parked on one of those values is resumed. Without async
+        scheduling the sampled tokens reach the earlier stages through the
+        scheduler instead, so the last stage puts the same entries on its
+        output, on the host, and the scheduler carries them to every stage
+        with the request's next step (see `pp_scheduler`).
         """
         from ..pp_transport import pack, to_host, unpack
 
@@ -947,9 +945,12 @@ class NNsightGPUModelRunner(GPUModelRunner):
         Every rank ran the block and so has workers to wind up, which is why every
         rank is called; an early return on the others once left their workers in
         place for the life of the engine. But only the first tensor-parallel rank
-        replies with values, and the rest return ``None``: every rank runs every
-        layer and its reads are gathered across the group, so each holds the same
-        values, and pickling them on every rank would only be thrown away.
+        of each pipeline stage replies with values, and the rest return ``None``:
+        the ranks of a stage run the same layers and their reads are gathered
+        across the group, so each holds the same values, and pickling them on
+        every rank would only be thrown away. Under pipeline parallelism each
+        stage replies, and the engine merges the replies (see
+        [`merge_collected`][nnsight.modeling.vllm.engines.engine.merge_collected]).
 
         A registered block's values are kept apart from the trace's own because
         they are not the same kind of thing: a name a *trace* saved on several
@@ -991,10 +992,6 @@ class NNsightGPUModelRunner(GPUModelRunner):
         if finished:
             requests.harvest(finished)
 
-        # Every rank ran the block and reports what it saved; the engine keeps
-        # the last rank's value of each name and fills a marker in it (a read
-        # the block only saved, of a location another stage holds) from that
-        # stage's copy (see engine.merge_collected).
         taps = self.nnsight_model.interleaver.taps
         for request in list(requests.requests.values()):
             if not request.named(wanted):

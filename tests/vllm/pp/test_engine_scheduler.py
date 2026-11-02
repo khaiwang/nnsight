@@ -65,9 +65,20 @@ def test_without_async_scheduling_the_values_go_back_through_nnsights_scheduler(
     assert result["sums"] == run("default")["sums"]
 
 
-def test_ray_picked_by_vllm_inside_a_placement_group_gets_nnsights_scheduler():
+def test_ray_picked_by_vllm_inside_a_placement_group_gets_the_scheduler_its_config_needs():
+    """Whether async scheduling stays on under Ray depends on the vLLM release
+    (0.19's compiled-graph executor turned it off; 0.27's default executor keeps
+    it), so the scheduler is checked against what the finished config says."""
     pytest.importorskip("ray")
     result = run("ray_auto")
+    assert result["backend"] == "ray"
+    assert result["scheduler"] == ("AsyncScheduler" if result["async_scheduling"] else "NNsightScheduler")
+    assert result["sums"] == run("default")["sums"]
+
+
+def test_ray_without_async_scheduling_sends_the_values_back_through_nnsights_scheduler():
+    pytest.importorskip("ray")
+    result = run("ray_sync")
     assert result["backend"] == "ray" and result["async_scheduling"] is False
     assert result["scheduler"] == "NNsightScheduler"
     assert result["sums"] == run("default")["sums"]

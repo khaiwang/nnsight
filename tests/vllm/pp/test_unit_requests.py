@@ -1,9 +1,7 @@
-"""The request table's two exits: what a finished request's registered block
-saved, and what the engine let go of when the request left; and what collect
-clears when a request's saves leave."""
+"""The request table's exit: what the engine lets go of when a request leaves;
+and what an earlier pipeline stage sends home at collect."""
 
 import pickle
-import threading
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +15,7 @@ from nnsight.modeling.vllm.model_runners.GPUModelRunner import (
     Request,
     Requests,
 )
-from nnsight.tracing.tracer import _saves, mark
+from nnsight.modeling.vllm.model_runners import GPUModelRunner as runner_module
 
 
 def _registered(requests, request_id, registration_id, lcls):
@@ -31,22 +29,6 @@ def _registered(requests, request_id, registration_id, lcls):
     return request
 
 
-def test_saves_recorded_on_the_forward_thread_survive_a_collect_on_another():
-    """Under Ray the collect arrives on another thread than the forward, and that
-    thread's saved-id set is empty; the registered block's saved name still
-    comes home."""
-    requests = Requests()
-    resid_probe = torch.arange(6.0)
-    request = _registered(requests, "tenant-7-0000beef", "norm-watch", {"resid_probe": mark(resid_probe)})
-    requests.record_saves()  # end of the step, on the forward thread
-
-    collect = threading.Thread(target=requests.harvest, args=({request.id},))
-    collect.start()
-    collect.join()
-
-    assert request.harvested["norm-watch"]["saves"]["resid_probe"] is resid_probe
-
-
 def test_a_request_that_leaves_through_harvest_is_released():
     """An untraced request whose registered block saved nothing leaves when the
     scheduler reports it finished, before any collect; whatever else the engine
@@ -54,7 +36,6 @@ def test_a_request_that_leaves_through_harvest_is_released():
     released = []
     requests = Requests(release=released.append)
     request = _registered(requests, "chat-00c0ffee", "quiet-edit", {})
-    requests.record_saves()
 
     requests.harvest({request.id})
 
@@ -62,22 +43,24 @@ def test_a_request_that_leaves_through_harvest_is_released():
     assert released == [request.id]
 
 
-def test_a_stage_that_does_not_send_its_saves_still_clears_their_ids():
-    """An earlier stage whose saves the engine does not need sends none home,
-    but its saved ids are still dropped: a resident parameter it saved is the
-    same object when a later block on this stage reads it without saving."""
+def test_a_stage_whose_saves_are_not_needed_sends_none_home(monkeypatch):
+    """A stage before the last whose caches observed nothing replies with its
+    request's entry but no saves: the last stage's copy of the block holds
+    every value, and the engine keeps that one."""
+    monkeypatch.setattr(runner_module, "get_tp_group", lambda: SimpleNamespace(is_first_rank=True))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)  # runs without a GPU
     runner = object.__new__(NNsightGPUModelRunner)
     runner.nnsight_requests = Requests()
     runner.nnsight_model = SimpleNamespace(interleaver=SimpleNamespace(taps=frozenset()))
-    runner._reports_saves = lambda mediator: False  # a stage before the last, nothing to fill
+    runner._reports_saves = lambda mediator: False  # a stage before the last, no cache here
     runner._parked_on_later_stage = lambda mediator: False
-    down_proj_weight = torch.zeros(3)  # stands in for a parameter the engine keeps resident
+    down_proj_weight = torch.zeros(3)
     request = Request("probe-0000abcd")
-    request.mediator = Mediator(compile("pass", "<traced>", "exec"), {}, {"down_w": mark(down_proj_weight)})
-    request.mediator.nnsight_saved = {"down_w"}
+    request.mediator = Mediator(compile("pass", "<traced>", "exec"), {}, {"down_w": down_proj_weight})
+    request.mediator.saves = {id(down_proj_weight)}
     runner.nnsight_requests.requests[request.id] = request
 
     collected = pickle.loads(runner.collect_nnsight([request.id], [request.id]))
 
     assert collected["probe"]["saves"] == {}
-    assert id(down_proj_weight) not in _saves()
+    assert request.id not in runner.nnsight_requests.requests
