@@ -44,6 +44,7 @@ from ..batching import VLLMBatcher
 from ..collect import dumps_compact
 from ..fragments import VLLMFragments
 from ..interleaver import VLLMInterleaver
+from ..kernel import register_kernels
 from ..vllm import VLLM
 
 if TYPE_CHECKING:
@@ -504,6 +505,8 @@ class NNsightGPUModelRunner(GPUModelRunner):
             interleaver=VLLMInterleaver(taps, fragments=VLLMFragments()),
         )
         self.nnsight_model.tokenizer = cached_tokenizer_from_config(self.model_config)
+        # Kernel sites on the attention backend this worker runs (see `..kernel`).
+        register_kernels()
 
         interleaver = self.nnsight_model.interleaver
         # No envoy: the spans come from the scheduler rather than from an invoke,

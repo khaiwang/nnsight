@@ -229,8 +229,9 @@ kernel, the location never fires and the trace ends with `OutOfOrderError:
   CodeGen, GPT-J, DeBERTa).
 - An MoE layer running under `experts_implementation="eager"` (or `deepgemm`,
   `sonicmoe`, FP8, or `kernels`).
-- A vLLM model, where attention and state-space layers run through vLLM's own
-  custom ops.
+- A vLLM model's state-space and MoE layers, and its attention on any backend
+  other than FlashAttention or under `taps`. vLLM's FlashAttention sites are
+  described in [models/vllm.md](../models/vllm.md#attention-kernel-sites).
 
 ## Recurrent states of a chunked kernel
 
@@ -471,7 +472,7 @@ to the transformers `CATALOG` applies to models constructed afterward.
   `chunk_gated_delta_rule_fwd_h` (such as FlashQLA on SM90 and later) are served
   as `Unavailable`, raising a `ValueError` with the reason at the request. A
   model whose hub wrapper is replaced by the `kernels` library has no recurrent
-  entry. Paged attention has no sites. vLLM's fused MoE has no entry: its
+  entry. vLLM's fused MoE has no entry: its
   `FusedMoE` layer runs experts inside the custom op
   `torch.ops.vllm.moe_forward`, whose Triton kernels keep per-pair rows in
   op-local workspace buffers that neither AST instrumentation nor a dispatch mode

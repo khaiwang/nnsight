@@ -352,6 +352,50 @@ model.model.norm.output
 
 Paths from `model.named_modules()` carry the root's name (`model.model.layers.0`); `model.get(...)` and `taps=` take the path without it (`model.layers.0`), and `model.taps` reports the prefixed form.
 
+## Attention kernel sites
+
+On vLLM's FlashAttention backend (the default on CUDA), the inner attention
+layer carries the [kernel sites](../usage/kernel.md) `lse`, `scores` and
+`probs`. The layer is the `Attention` module inside the model's attention
+block: `model.transformer.h[i].attn.attn` on GPT-2, `model.model.layers[i].self_attn.attn`
+on Llama-style models.
+
+```python
+attn = model.transformer.h[0].attn.attn
+with model.trace("The Eiffel Tower is in", max_tokens=3, temperature=0.0) as tracer:
+    steps = list().save()
+    for _ in tracer.iter[:3]:
+        steps.append(attn.kernel.probs().clone())
+# [tuple(p.shape) for p in steps] == [(7, 12, 7), (1, 12, 8), (1, 12, 9)]  (the prompt is 7 tokens)
+```
+
+Shapes follow vLLM's layout: there is no batch axis, and an invoke sees only
+its own request.
+
+| Site | Shape | Value |
+|------|-------|-------|
+| `lse` | `[queries, heads]` | The logsumexp the kernel computed for each query row, fp32. |
+| `scores` | `[queries, heads, keys]` | `q . k * scale` in fp32, `-inf` above the causal diagonal. |
+| `probs` | `[queries, heads, keys]` | `exp(scores - lse)`, fp32. |
+
+The query axis holds the rows the engine computed in this step: every prompt
+token on the prefill step, one token on each decode step. The key axis always
+spans every token of the request so far, read from the request's pages of the
+KV cache. `query=`, `heads=` and `key=` select along each axis with the rules of
+[kernel sites](../usage/kernel.md#sites), and a selection is applied before the
+matrix is built, so `probs(query=-1, heads=3)` costs one row.
+
+The values are rebuilt from the kernel's query rows, the cached keys and the
+kernel's own logsumexp, which the kernel returns from the same launch that
+computes the attention output. On GPT-2 layer 0 they equal the HF site's
+`probs` in bf16 to 1e-5. Deeper layers differ from HF by the bf16 rounding the
+two engines accumulate in the residual stream.
+
+A call the reconstruction does not model raises `ValueError` with the reason
+at the request: a sliding window, ALiBi, a logit soft cap, or an fp8 KV cache.
+The sites are validated on one GPU. They are not served under `taps` or on other
+attention backends (Triton, FlashInfer, MLA).
+
 ## CUDA graphs with taps
 
 vLLM's decode throughput comes largely from CUDA-graph replay, which `enforce_eager=True` gives up because a replayed graph runs no Python and so no hooks. `taps` keeps the graphs: the locations you name are recorded *into* the graph as breaks (vLLM's `VLLM_USE_BREAKABLE_CUDAGRAPH`), and at each break the interleaver's normal handoff runs on every replay. Everything else is unchanged — the same trace syntax, per-request scoping, `tracer.iter`, `model.logits` / `model.samples`.
@@ -454,10 +498,11 @@ False ...}`.
 - **No speculative decoding** — a speculative step scores several draft tokens per request, and a block is scoped to one logits row and one sampled token per request. `VLLM(..., speculative_config=...)` raises `NotImplementedError` before anything is built.
 - **No data parallelism** — vLLM answers the call that brings a request's saved values back from its first engine only, so `VLLM(..., data_parallel_size=N)` with `N > 1` raises `NotImplementedError` before anything is built. Use `tensor_parallel_size`, or one `VLLM` per GPU.
 - **No backward / gradients, and no source tracing inside a fused CUDA kernel** — the kernel's
-  inputs and outputs are locations; its interior is not Python. Kernel sites ([kernel sites](../usage/kernel.md))
-  such as `attn.kernel.probs(...)` and `mixer.kernel.states(...)` are also unavailable on vLLM:
-  vLLM's attention, Mamba, and gated-delta layers execute through vLLM's own custom ops and state
-  caches, so requesting `.kernel` ends in `OutOfOrderError` because the location is never reached.
+  inputs and outputs are locations; its interior is not Python. Of the [kernel sites](../usage/kernel.md),
+  only attention on the FlashAttention backend is served ([Attention kernel sites](#attention-kernel-sites)).
+  Recurrent and MoE sites such as `mixer.kernel.states(...)` are unavailable: vLLM's Mamba, gated-delta
+  and fused-MoE layers execute through vLLM's own custom ops and state caches, so requesting `.kernel`
+  there ends in `OutOfOrderError` because the location is never reached.
 - **No `.scan()`.** It propagates shapes by running the model's own forward under a fake-tensor
   mode, and there is no forward on this side to run. `model.scan(...)` raises
   `NotImplementedError: scan is unavailable on vLLM: ... Trace a prompt and read the shapes off the
