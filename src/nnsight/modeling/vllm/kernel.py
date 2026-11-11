@@ -21,8 +21,10 @@ serves one, and the key axis always spans every token of the request so far.
 
 Sites take ``query=``, ``heads=`` and ``key=`` with the indexing rules of
 intervention/sites.py. Calls the reconstruction does not model (a sliding
-window, ALiBi, a logit soft cap, an fp8 cache, or a call without a block table)
-are served as `Unavailable`.
+window, ALiBi, a logit soft cap, attention sinks, a custom mask, a key cache in
+another dtype than the queries such as fp8, a call without a block table, or
+one of the several calls vLLM merges under cascade or context-parallel
+attention) are served as `Unavailable`.
 
 `CATALOG` has one row, registered in the worker process (`register_kernels`), on the eager
 engine: under ``taps`` a replayed step runs no module controller, so the shim
@@ -50,7 +52,9 @@ def serve(fn: Callable, args: tuple, kwargs: dict) -> tuple[Any, Sites]:
     asked = bound["return_softmax_lse"]
     output, lse = fn(**{**bound, "return_softmax_lse": True})
     result = (output, lse) if asked else output
-    reason = _unsupported(bound)
+    # vLLM asks for the logsumexp itself only to merge several kernel calls into one attention (cascade and
+    # context-parallel paths), where one call covers part of each request's keys.
+    reason = "the call is one of several that vLLM merges into one attention" if asked else _unsupported(bound)
     if reason is not None:
         return result, Unavailable(f"{NAME}: {reason}; its kernel sites are not served on this call")
     return result, Paged(bound, lse)
@@ -60,8 +64,12 @@ def _unsupported(bound: dict[str, Any]) -> str | None:
     """Why the reconstruction does not model this call, or ``None``."""
     if bound["block_table"] is None or bound["cu_seqlens_q"] is None or bound["seqused_k"] is None:
         return "the call does not read keys from the paged cache"
-    if not bound["k"].dtype.is_floating_point:
-        return f"the key cache is stored as {bound['k'].dtype}"
+    if bound["k"].dtype != bound["q"].dtype:
+        return f"the key cache is stored as {bound['k'].dtype} and the queries as {bound['q'].dtype}"
+    if bound["s_aux"] is not None:
+        return "the call adds attention sinks"
+    if bound["mask_mod"] is not None or bound["dynamic_causal"] is not None:
+        return "the call uses a custom attention mask"
     if bound["alibi_slopes"] is not None:
         return "the call adds ALiBi biases"
     if bound["softcap"]:

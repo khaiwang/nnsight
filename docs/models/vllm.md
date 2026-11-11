@@ -392,7 +392,9 @@ computes the attention output. On GPT-2 layer 0 they equal the HF site's
 two engines accumulate in the residual stream.
 
 A call the reconstruction does not model raises `ValueError` with the reason
-at the request: a sliding window, ALiBi, a logit soft cap, or an fp8 KV cache.
+at the request: a sliding window, ALiBi, a logit soft cap, attention sinks, a
+custom mask, an fp8 KV cache, or a step vLLM computes with cascade or
+context-parallel attention (several kernel calls merged into one).
 The sites are validated on one GPU. They are not served under `taps` or on other
 attention backends (Triton, FlashInfer, MLA).
 
