@@ -3,7 +3,7 @@ title: Kernel Support Map
 one_liner: Which fused kernels `.kernel` sites cover, ranked by what the major runtimes default to.
 tags: [internals, dev, kernel]
 related: [docs/usage/kernel.md]
-sources: [src/nnsight/intervention/attention.py, src/nnsight/modeling/kernels/transformers.py, src/nnsight/modeling/kernels/eager.py, src/nnsight/modeling/kernels/recurrent.py, src/nnsight/modeling/kernels/experts.py]
+sources: [src/nnsight/intervention/attention.py, src/nnsight/modeling/kernels/transformers.py, src/nnsight/modeling/kernels/eager.py, src/nnsight/modeling/kernels/flash.py, src/nnsight/modeling/kernels/recurrent.py, src/nnsight/modeling/kernels/experts.py]
 ---
 
 # Kernel support map
@@ -55,7 +55,7 @@ diffusers, vLLM, and SGLang on Hopper.
 |---|---|---|
 | `F.scaled_dot_product_attention` (flash, memory-efficient, cuDNN and CPU flash backends, math fallback) | transformers `sdpa`, diffusers, any PyTorch model | in CI for the CPU backends. CUDA backends default call served, by GPU tests on randomly initialized modules that CI does not run: the flash backend is compared with an fp32 reference, and the memory-efficient and cuDNN backends are checked for unchanged output and rows that sum to 1. Diffusion models not validated |
 | FlashAttention 3 and 4 | transformers `flash_attention_3/4`, vLLM on Hopper and Blackwell, SGLang on Hopper | not started; needs a Hopper or Blackwell GPU |
-| `flash_attn_func`, `flash_attn_varlen_func` (FlashAttention 2) | transformers `flash_attention_2`, from the `flash_attn` package or `kernels-community/flash-attn2` | not started |
+| `flash_attn_func`, `flash_attn_varlen_func` (FlashAttention 2) | transformers `flash_attention_2`, from the `flash_attn` package or `kernels-community/flash-attn2` | default call served, read at transformers' `_flash_attention_forward`. CPU tests run transformers' FlashAttention 2 path end to end with stand-in kernels; on an A100 the GPU test matches the `sdpa` sites on a two-layer random Llama with the hub kernel. Not run with the `flash_attn` package |
 | `flash_attn_varlen_func` in vLLM's fork | vLLM `FLASH_ATTN` | default call validated with FlashAttention 2 on an A100, on the unmerged `kernel-vllm` branch |
 | transformers paged attention (`flash_attn_with_kvcache` for the flash implementations) | transformers continuous batching | not started |
 | any of the above inside a `torch.compile` region | compiled models | not started |

@@ -1,3 +1,4 @@
+import functools
 import gc
 import math
 import sys
@@ -1366,6 +1367,194 @@ class TestExperts:
         assert [step.shape for step in steps] == [(2, 7, 32), (2, 1, 32)]
 
 
+def _dense_flash(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1), softcap=0.0, alibi_slopes=None, deterministic=False, return_attn_probs=False):
+    """Stand-in with FlashAttention 2's dense signature and return convention, computed in fp32 with the mask aligned bottom right."""
+    out, lse = _flash_math(q, k, v, softmax_scale, causal)
+    return (out, lse, None) if return_attn_probs else out
+
+
+def _flash_math(q, k, v, softmax_scale, causal):
+    """The stand-ins' shared computation, kept out of the kernel registry so a packed call does not shim its per-span calls."""
+    scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+    keys = k.float().repeat_interleave(q.shape[2] // k.shape[2], 2)
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), keys) * scale
+    if causal:
+        rows, cols = torch.arange(q.shape[1], device=q.device)[:, None], torch.arange(k.shape[1], device=q.device)[None, :]
+        scores = scores.masked_fill(cols > rows + (k.shape[1] - q.shape[1]), float("-inf"))
+    values = v.float().repeat_interleave(q.shape[2] // v.shape[2], 2)
+    out = torch.einsum("bhqk,bkhd->bqhd", torch.softmax(scores, -1), values).to(q.dtype)
+    return out, torch.logsumexp(scores, -1)
+
+
+def _packed_flash(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p=0.0, softmax_scale=None, causal=False, window_size=(-1, -1), softcap=0.0, alibi_slopes=None, deterministic=False, return_attn_probs=False, block_table=None):
+    """Stand-in with FlashAttention 2's varlen signature: one dense call per span, rows concatenated and lse as ``[heads, rows]``."""
+    outs, lses = [], []
+    for i in range(len(cu_seqlens_q) - 1):
+        rows, cols = slice(cu_seqlens_q[i], cu_seqlens_q[i + 1]), slice(cu_seqlens_k[i], cu_seqlens_k[i + 1])
+        out, lse = _flash_math(q[None, rows], k[None, cols], v[None, cols], softmax_scale, causal)
+        outs.append(out[0])
+        lses.append(lse[0])
+    out = torch.cat(outs)
+    return (out, torch.cat(lses, -1), None) if return_attn_probs else out
+
+
+@pytest.fixture
+def stand_in_flash(monkeypatch):
+    """Make transformers load the CPU stand-ins as its FlashAttention 2 functions, restoring its globals afterwards."""
+    from transformers import modeling_flash_attention_utils as utils
+
+    for name in ("_loaded_implementation", "_flash_fn", "_flash_varlen_fn", "_flash_with_kvcache_fn", "_pad_fn", "_unpad_fn", "_process_flash_kwargs_fn", "_process_with_kvcache_kwargs_fn"):
+        monkeypatch.setattr(utils, name, vars(utils)[name])
+    monkeypatch.setattr(utils, "_lazy_imports", lambda *args, **kwargs: (_dense_flash, _packed_flash, None, utils._pad_input, utils._unpad_input))
+    return utils
+
+
+def _llama(implementation):
+    """Build a two-layer Llama (4 query heads, 2 key-value heads) with the same weights for every ``implementation``."""
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    config = LlamaConfig(vocab_size=256, hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2)
+    torch.manual_seed(0)
+    module = LlamaForCausalLM(config)
+    # Set after construction: constructing under flash_attention_2 checks for the package and a GPU.
+    module.config._attn_implementation = implementation
+    return module
+
+
+def _padded(*prompts):
+    """Left-pad lists of token ids (pad token 0) into ``input_ids`` and ``attention_mask``."""
+    length = max(map(len, prompts))
+    return {
+        "input_ids": torch.tensor([[0] * (length - len(prompt)) + prompt for prompt in prompts]),
+        "attention_mask": torch.tensor([[0] * (length - len(prompt)) + [1] * len(prompt) for prompt in prompts]),
+    }
+
+
+def _attention_sites(model, inputs, layer=0):
+    with model.trace(inputs):
+        site = model.model.layers[layer].self_attn.kernel
+        probs, scores, lse = site.probs().save(), site.scores().save(), site.lse().save()
+    return probs, scores, lse
+
+
+class TestFlash:
+    """FlashAttention 2 sites, read at transformers' ``_flash_attention_forward``, against the SDPA sites of a model with the same weights."""
+
+    SHORT, LONG = [5, 9], [4, 8, 2, 6, 1, 3]
+
+    @pytest.fixture
+    def models(self, stand_in_flash):
+        return _wrap(_llama("flash_attention_2")), _wrap(_llama("sdpa"))
+
+    def test_padded_batch_matches_the_sdpa_sites_row_for_row(self, models):
+        flash, sdpa = models
+        inputs = _padded(self.SHORT, self.LONG, [7])
+        for layer in (0, 1):
+            probs, scores, lse = _attention_sites(flash, inputs, layer)
+            expected, expected_scores, expected_lse = _attention_sites(sdpa, inputs, layer)
+            real = inputs["attention_mask"].bool()[:, None, :].expand_as(lse)
+            assert probs.shape == (3, 4, 6, 6)
+            assert probs.provenance.kind == "exact reconstruction" and lse.provenance.kind == "exact export"
+            assert torch.allclose(probs, expected, atol=1e-6)
+            assert torch.allclose(scores.clamp(min=-1e4), expected_scores.clamp(min=-1e4), atol=1e-4)
+            assert torch.allclose(lse[real], expected_lse[real], atol=1e-5)
+            assert torch.isneginf(lse[~real]).all() and (probs[0, :, :4] == 0).all()
+
+    def test_invokes_of_different_lengths_each_get_their_rows(self, models):
+        saved = []
+        for model in models:
+            with model.trace() as tracer:
+                with tracer.invoke(_padded(self.SHORT)):
+                    first = model.model.layers[0].self_attn.kernel.probs().save()
+                with tracer.invoke(_padded(self.LONG, [7, 11])):
+                    second = model.model.layers[0].self_attn.kernel.probs().save()
+                with tracer.invoke():
+                    everything = model.model.layers[0].self_attn.kernel.probs().save()
+            saved.append((first, second, everything))
+        assert [tuple(probs.shape) for probs in saved[0]] == [(1, 4, 6, 6), (2, 4, 6, 6), (3, 4, 6, 6)]
+        for probs, expected in zip(*saved):
+            assert torch.allclose(probs, expected, atol=1e-6)
+
+    @pytest.mark.parametrize("options", [{}, {"num_beams": 2}, {"prefill_chunk_size": 2}])
+    def test_generation_steps_match_the_sdpa_sites(self, models, options):
+        saved = []
+        for model in models:
+            with model.generate(_padded(self.SHORT, [4, 8, 2, 6]), max_new_tokens=3, do_sample=False, **options) as tracer:
+                steps = nnsight.save([])
+                for _ in tracer.iter[:3]:
+                    steps.append(model.model.layers[0].self_attn.kernel.probs())
+            saved.append(steps)
+        assert len(saved[0]) == 3
+        for probs, expected in zip(*saved):
+            assert probs.shape == expected.shape and torch.allclose(probs, expected, atol=1e-6)
+
+    def test_sequences_packed_into_one_row_do_not_attend_across(self, models):
+        flash, sdpa = models
+        ids = torch.tensor([[5, 9, 7, 3, 4, 8, 2]])
+        # Positions restart at 2, as in models whose positions start after a padding index.
+        positions = torch.tensor([[2, 3, 4, 2, 3, 4, 5]])
+        with flash.trace({"input_ids": ids, "position_ids": positions}):
+            probs = flash.model.layers[0].self_attn.kernel.probs().save()
+        for span in (slice(0, 3), slice(3, 7)):
+            with sdpa.trace({"input_ids": ids[:, span], "position_ids": positions[:, span]}):
+                expected = sdpa.model.layers[0].self_attn.kernel.probs().save()
+            assert torch.allclose(probs[:, :, span, span], expected, atol=1e-6)
+        assert (probs[:, :, :3, 3:] == 0).all() and (probs[:, :, 3:, :3] == 0).all()
+
+    @pytest.mark.parametrize("option,name", [({"sliding_window": 2}, "window_size"), ({"softcap": 30.0}, "softcap"), ({"dropout": 0.1}, "dropout_p")])
+    def test_a_call_with_an_option_that_changes_the_attention_is_refused(self, models, monkeypatch, option, name):
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+        flash, _ = models
+        interface = ALL_ATTENTION_FUNCTIONS._global_mapping["flash_attention_2"]
+        monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "flash_attention_2", lambda *args, **kwargs: interface(*args, **{**kwargs, **option}))
+        with pytest.raises(ValueError, match=f"do not cover FlashAttention 2 called with {name}"):
+            with flash.trace(_padded(self.LONG)):
+                flash.model.layers[0].self_attn.kernel.probs().save()
+
+    def test_another_flash_implementation_is_refused(self, stand_in_flash):
+        model = _wrap(_llama("flash_attention_3"))
+        with pytest.raises(ValueError, match="this call ran 'flash_attention_3'"):
+            with model.trace(_padded(self.LONG)):
+                model.model.layers[0].self_attn.kernel.probs().save()
+
+    def test_a_packed_logsumexp_in_the_older_layout_is_recomputed(self, models, stand_in_flash, monkeypatch):
+        flash, sdpa = models
+
+        @functools.wraps(_packed_flash)
+        def older(*args, **kwargs):
+            """Return the logsumexp as flash_attn 2.3.3 to 2.5.9 do: ``[sequences, heads, longest sequence]``."""
+            result = _packed_flash(*args, **kwargs)
+            if not kwargs.get("return_attn_probs"):
+                return result
+            return result[0], result[1].new_zeros(2, result[1].shape[0], 6), None
+
+        monkeypatch.setattr(stand_in_flash, "_lazy_imports", lambda *args, **kwargs: (_dense_flash, older, None, stand_in_flash._pad_input, stand_in_flash._unpad_input))
+        inputs = _padded(self.SHORT, self.LONG)
+        probs, _, lse = _attention_sites(flash, inputs)
+        assert lse.provenance.kind == "replay" and probs.provenance.kind == "replay"
+        assert torch.allclose(probs, _attention_sites(sdpa, inputs)[0], atol=1e-6)
+
+    def test_an_edit_copy_is_served_after_its_original_is_freed(self, models):
+        _, sdpa = models
+        original = _wrap(_llama("flash_attention_2"))
+        with original.edit() as (_, copy):
+            pass
+        del original
+        gc.collect()
+        inputs = _padded(self.LONG)
+        assert torch.allclose(_attention_sites(copy, inputs)[0], _attention_sites(sdpa, inputs)[0], atol=1e-6)
+
+    def test_holders_and_the_loader_are_untouched_outside_a_served_call(self, models):
+        from transformers import modeling_flash_attention_utils as utils
+        from transformers.integrations import flash_attention
+
+        flash, _ = models
+        _attention_sites(flash, _padded(self.LONG))
+        assert flash_attention._flash_attention_forward is utils._flash_attention_forward
+        assert utils.lazy_import_flash_attention("flash_attention_2")[0][:2] == (_dense_flash, _packed_flash)
+
+
 class TestWorkloads:
     """End-to-end interpretability workloads executed through `.kernel` sites."""
 
@@ -1511,6 +1700,27 @@ class TestCuda:
         assert torch.allclose(probs, expected[:, [1, 6], -1], atol=1e-5)
         assert torch.allclose(lse, expected_lse, atol=1e-4)
         assert torch.allclose(probs.sum(-1), torch.ones_like(probs.sum(-1)), atol=1e-5)
+
+    def test_flash_attention_2_matches_the_sdpa_sites(self):
+        pytest.importorskip("kernels")
+        torch.manual_seed(0)
+        flash, sdpa = (_wrap(_llama(implementation).to("cuda", torch.bfloat16)) for implementation in ("flash_attention_2", "sdpa"))
+        inputs = {name: value.cuda() for name, value in _padded([5, 9], [4, 8, 2, 6, 1, 3]).items()}
+        probs, _, lse = _attention_sites(flash, inputs)
+        expected, _, expected_lse = _attention_sites(sdpa, inputs)
+        real = inputs["attention_mask"].bool()[:, None, :].expand_as(lse)
+        assert probs.provenance.kind == "exact reconstruction"
+        assert torch.allclose(probs, expected, atol=1e-5)
+        assert torch.allclose(lse[real], expected_lse[real], atol=1e-4)
+        saved = []
+        for model in (flash, sdpa):
+            with model.generate(inputs, max_new_tokens=2, do_sample=False) as tracer:
+                steps = nnsight.save([])
+                for _ in tracer.iter[:2]:
+                    steps.append(model.model.layers[0].self_attn.kernel.probs())
+            saved.append(steps)
+        for step, expected in zip(*saved):
+            assert torch.allclose(step, expected, atol=1e-5)
 
     @pytest.mark.parametrize("backend", ["EFFICIENT_ATTENTION", "CUDNN_ATTENTION"])
     def test_kernels_that_write_lse_on_request_leave_the_output_unchanged(self, backend):
