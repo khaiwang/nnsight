@@ -398,9 +398,14 @@ def serve_gated_delta_chunk(fn: Callable, args: tuple, kwargs: dict) -> tuple[An
             f"its loop no longer has the shape this reader expects"
         )
     batch, heads, head_dim = states[0].shape[0], states[0].shape[1], states[0].shape[2]
-    # The first recorded binding of `key` is the fp32 (and optionally L2-normalized)
-    # key of shape [batch, heads, length, K], before the kernel pads and reshapes it into chunks.
-    key = recorded["key"][0] if recorded["key"] else None
+    # The fp32 key of shape [batch, heads, length, K], before the kernel pads and reshapes it into
+    # chunks, is the first recorded binding of `key`. From transformers 5.24 a key with fewer heads
+    # than the value is first repeated across the value heads, in the argument's
+    # [batch, length, heads, K] layout, and that binding comes ahead of it.
+    keys = recorded["key"]
+    grouped = bound["key"].shape[2] != bound["value"].shape[2]
+    repeated = grouped and len(keys) > 1 and tuple(keys[0].shape[1:3]) == (length, heads)
+    key = keys[1] if repeated else keys[0] if keys else None
     expected = {
         "key": (key, (batch, heads, length, head_dim)),
         "pairwise_decay": (_last(recorded, "pairwise_decay"), (batch, heads, chunks, chunk_size, chunk_size)),
