@@ -509,6 +509,44 @@ FlashInfer kernel (vLLM's choice on Hopper), which returns no chunk states;
 speculative decoding, where draft tokens advance states that are later
 discarded; and the Kimi and OLMo gated delta rule layers.
 
+
+## Expert kernel sites
+
+On a model whose MoE layers run vLLM's Triton experts kernel, the MoE module
+(`MoERunner`, for example `layers[i].mlp.experts` on DeepSeek-V2) carries the
+[expert kernel sites](../usage/kernel.md) of the transformers reader:
+
+```python
+mlp = model.model.layers[3].mlp                         # DeepSeek-V2-Lite
+with model.trace(prompt, max_tokens=1, temperature=0.0):
+    logits = mlp.gate.output[0].save()                               # [tokens, experts]
+    act = mlp.experts.kernel.expert_activation().clone().save()      # [tokens, top_k, intermediate]
+    out = mlp.experts.kernel.expert_output(tokens=-1).save()         # [top_k, hidden]
+    one = mlp.experts.kernel.expert_output(expert=7).save()          # [tokens, hidden], 0 where not routed
+```
+
+| Site | Shape | Value |
+|------|-------|-------|
+| `expert_input` | `[tokens, top_k, hidden]` | The layer's input row. |
+| `expert_activation` | `[tokens, top_k, intermediate]` | The kernel's own activation rows, copied before vLLM reuses the workspace. |
+| `expert_output` | `[tokens, top_k, hidden]` | The down projection before the routing weight. The kernel multiplies by the routing weight in the same pass and never stores this row, so the selected rows are recomputed from the activation rows and the expert's weight (provenance `replay`). |
+
+There is no batch axis, and an invoke reads only its own tokens of the step.
+
+Slot `k` is the token's `k`-th routed expert in the kernel's order. vLLM ranks
+experts on bf16 scores, so for two experts with nearly equal scores the order
+can differ from a top-k taken over `gate.output` in fp32. `expert=` selects by
+expert id and does not depend on the order.
+
+The MoE module's `.output` is the weighted sum of the routed rows plus the
+shared experts when the model has them. On DeepSeek-V2-Lite layer 3, the
+activation and output rows equal an fp32 computation from the layer's weights
+to 1% of each row's largest entry, and the weighted sum plus the shared experts
+equals the module output to 0.7% per token.
+
+Not served: other experts kernels (FlashInfer, batched Triton, quantized
+weights or activations), LoRA, and tensor or expert parallelism.
+
 ## CUDA graphs with taps
 
 vLLM's decode throughput comes largely from CUDA-graph replay, which `enforce_eager=True` gives up because a replayed graph runs no Python and so no hooks. `taps` keeps the graphs: the locations you name are recorded *into* the graph as breaks (vLLM's `VLLM_USE_BREAKABLE_CUDAGRAPH`), and at each break the interleaver's normal handoff runs on every replay. Everything else is unchanged — the same trace syntax, per-request scoping, `tracer.iter`, `model.logits` / `model.samples`.

@@ -128,9 +128,7 @@ class Experts(Sites):
         else:
             slots = sites.indices(spec.get("slot"), top_k, pairs.device)
             pairs, index = sites.select(pairs, axis + 1, slots), sites.select(index, axis + 1, slots)
-        rows = self.buffers[name]
-        sites.warn_if_large((*pairs.shape, rows.shape[-1]), name, "tokens=, slot= or expert=", rows.dtype)
-        value = rows[pairs if self.inv_perm is None else self.inv_perm[pairs]]
+        value = self.gather(name, pairs, index)
         if "expert" in spec:
             mask = (index == expert % self.num_experts).unsqueeze(-1)
             value = torch.where(mask, value, value.new_zeros(())).sum(axis + 1)
@@ -139,7 +137,17 @@ class Experts(Sites):
         else:
             value = sites.squeeze(value, spec, {"slot": axis + 1, "tokens": axis})
             note = f"the forward's {_ROWS[name]} in token order; slot k is the token's k-th routed expert (top_k_index[..., k])"
-        return value, Provenance("exact export", self.op_name, note)
+        return value, Provenance(self.kind(name), self.op_name, note)
+
+    def kind(self, name: str) -> str:
+        """The provenance kind of site ``name``."""
+        return "exact export"
+
+    def gather(self, name: str, pairs: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        """Site ``name``'s rows for the token-ordered pair indices ``pairs``, whose experts are ``index``."""
+        rows = self.buffers[name]
+        sites.warn_if_large((*pairs.shape, rows.shape[-1]), name, "tokens=, slot= or expert=", rows.dtype)
+        return rows[pairs if self.inv_perm is None else self.inv_perm[pairs]]
 
 
 def _parallel(module: torch.nn.Module) -> bool:
