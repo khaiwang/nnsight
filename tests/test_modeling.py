@@ -1012,3 +1012,72 @@ class TestMetaAudio:
         assert all(p.device.type == "meta" for p in model._module.parameters())
         # The feature extractor is a real object, loaded off the repo id.
         assert model.feature_extractor is not None
+
+
+class TestMetaCheckpointClass:
+    """``pipeline()`` falls back to the class a checkpoint names in
+    ``config.architectures`` when none of the task's Auto classes lists it, so
+    the meta build and the ``config=`` load end on that class too."""
+
+    REPO = "trl-internal-testing/tiny-LlavaForConditionalGeneration"
+    TASK = "text-generation"
+
+    def test_meta_build_is_the_class_the_load_ends_on(self):
+        # `trust_remote_code` is an Auto class's kwarg; the named class takes none.
+        meta = TransformersModel(self.REPO, task=self.TASK, trust_remote_code=True)
+        loaded = TransformersModel(self.REPO, task=self.TASK, dispatch=True)
+        assert meta.dispatched is False
+        assert type(meta._module) is type(loaded._module)
+        assert [name for name, _ in meta._module.named_modules()] == [
+            name for name, _ in loaded._module.named_modules()
+        ]
+
+    def test_explicit_config_loads_the_named_class(self):
+        from transformers import AutoConfig
+
+        model = TransformersModel(
+            self.REPO,
+            task=self.TASK,
+            config=AutoConfig.from_pretrained(self.REPO),
+            dispatch=True,
+        )
+        assert type(model._module).__name__ == "LlavaForConditionalGeneration"
+
+    def test_explicit_config_tries_every_auto_class(self):
+        # Whisper is the third Auto class's under automatic-speech-recognition.
+        # With no named class to fall back on, only that walk reaches it.
+        from transformers import AutoConfig
+
+        repo = "hf-internal-testing/tiny-random-WhisperForConditionalGeneration"
+        config = AutoConfig.from_pretrained(repo)
+        config.architectures = None
+        model = TransformersModel(
+            repo, task="automatic-speech-recognition", config=config, dispatch=True
+        )
+        assert type(model._module).__name__ == "WhisperForConditionalGeneration"
+
+
+class TestMetaPreprocessors:
+    """``_loaded_preprocessors`` resolves the task's pipeline class whether
+    ``check_task`` stores ``impl`` as a class or as a dotted import path."""
+
+    def test_string_impl_resolves_preprocessor_flags(self, monkeypatch):
+        from transformers import pipelines
+
+        real_check_task = pipelines.check_task
+
+        def string_impl_check_task(task):
+            norm, targeted, opts = real_check_task(task)
+            impl = targeted["impl"]
+            dotted = (
+                impl
+                if isinstance(impl, str)
+                else f"{impl.__module__}.{impl.__qualname__}"
+            )
+            return norm, {**targeted, "impl": dotted}, opts
+
+        monkeypatch.setattr(pipelines, "check_task", string_impl_check_task)
+
+        stub = object.__new__(TransformersModel)
+        stub.task = "text-generation"
+        assert stub._loaded_preprocessors() == {"tokenizer"}
