@@ -106,6 +106,33 @@ as DeepSeek V3.
 Not placed yet: `flex_attention` (both transformers and vLLM register it), and
 the ROCm and CPU backends.
 
+## Axes and layout across ranks
+
+A reader declares its axes and how each is laid out across ranks
+([the reader contract](../usage/kernel.md#the-reader-contract-axes-and-their-layout-across-ranks)).
+This table is the plan for the common kernels. "Measured" means a run on a
+sharded model compared with a one-rank run; "from source" means read from the
+runtime's code or nnsight's docs and not run.
+
+| Kernel (runtime) | Axes | Tensor parallelism | Expert parallelism | Status |
+|---|---|---|---|---|
+| `flash_attn_varlen_func`, FlashAttention 2 (vLLM) | query, heads, key | heads `SPLIT`; query, key `WHOLE` | same ranks, same layout | declared; measured on Qwen2.5-0.5B at 2 ranks |
+| FlashAttention 3 and 4, FlashInfer, Triton (vLLM) | query, heads, key | heads `SPLIT`: vLLM shards the query projection by head before any attention backend runs (from source) | same | not started; needs the reader for each backend first |
+| MLA backends (vLLM) | not surveyed | not surveyed | not surveyed | not started |
+| `scaled_dot_product_attention`, eager, FlashAttention 2 (transformers) | heads, query, key after a batch dimension | heads `SPLIT` (from `docs/usage/kernel.md`) | not applicable | not declared: rank 0 returns its own heads. Next to move onto the contract |
+| gated delta rule, Kimi delta attention, Mamba (transformers) | chunks or tokens, heads after a batch dimension | all `WHOLE`: transformers gathers the projections before the kernel (from `docs/usage/kernel.md`) | not applicable | declared; needs no collective |
+| `gdn_attn`, `linear_attn`, `mamba1_attn`, `mamba2_attn` (vLLM) | not surveyed | not surveyed | not surveyed | not started; vLLM keeps the state in its own state cache |
+| `grouped_mm` and `batched_mm` experts forwards (transformers) | tokens, slot | intermediate dimension split and the down projection a partial sum (from the docstring in `modeling/kernels/experts.py`) | each rank holds the (token, expert) pairs routed to its experts, other pairs as sentinels | not served; needs two layouts the contract does not have yet |
+| fused MoE (vLLM) | tokens, slot | not surveyed | not surveyed | not started; the experts run inside one custom op |
+
+Layouts to add, each with its first user:
+
+- **Partial sum:** every rank holds one term of the value and the whole is
+  their sum. First user: the experts down projection under tensor parallelism.
+- **Routed:** each rank holds a data-dependent subset of the positions, named
+  by the kernel's own routing index. First user: experts under expert
+  parallelism.
+
 ## Recurrent and state-space kernels
 
 Not surveyed. Served today: gated delta rule, Kimi delta attention, Mamba2 and

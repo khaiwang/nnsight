@@ -114,3 +114,28 @@ def test_reading_a_site_leaves_the_logits_unchanged(vllm_gpt2):
         observed = vllm_gpt2.logits.clone().save()
     assert read.shape[1] == 12
     assert torch.equal(plain, observed)
+
+
+def test_tensor_parallel_ranks_serve_every_head(vllm_qwen_ref, vllm_qwen_tp):
+    """Each rank holds a block of the heads; a site reads all of them, indexed as on one rank."""
+
+    def read(model):
+        attn = model.model.layers[LAYER].self_attn.attn
+        with model.trace(PROMPT, max_tokens=2, temperature=0.0) as tracer:
+            steps = list().save()
+            for _ in tracer.iter[:2]:
+                steps.append(
+                    (
+                        attn.kernel.lse().clone(),
+                        attn.kernel.probs().clone(),
+                        attn.kernel.probs(query=-1, heads=9).clone(),
+                        attn.kernel.scores(heads=[13, 2, -8], key=slice(0, 4)).clone(),
+                    )
+                )
+        return steps
+
+    for whole, sharded in zip(read(vllm_qwen_ref), read(vllm_qwen_tp)):
+        assert whole[1].shape[1] == 14
+        for expected, value in zip(whole, sharded):
+            assert value.shape == expected.shape
+            assert torch.allclose(value, expected, atol=1e-5)

@@ -19,6 +19,10 @@ serves one, and the key axis always spans every token of the request so far.
   above the causal diagonal (``"exact reconstruction"``).
 * ``probs``: ``[queries, heads, keys]``, ``exp(scores - lse)``.
 
+Under tensor parallelism each rank's call holds one block of the heads. The
+reader declares ``heads`` as `SPLIT`, and `Sites.read` assembles the ranks'
+blocks, so ``heads=`` indexes the model's heads on any number of ranks.
+
 Sites take ``query=``, ``heads=`` and ``key=`` with the indexing rules of
 intervention/sites.py. Calls the reconstruction does not model (a sliding
 window, ALiBi, a logit soft cap, attention sinks, a custom mask, a key cache in
@@ -40,7 +44,7 @@ import torch
 from ...intervention import sites
 from ...intervention.attention import _exact_fp32
 from ...intervention.kernel import Attr, Located, Spec, register_catalog, unshimmed
-from ...intervention.sites import Batch, Provenance, Sites, Unavailable
+from ...intervention.sites import SPLIT, Batch, Provenance, Ranks, Sites, Unavailable
 from ...intervention.source import arguments
 
 NAME = "flash_attn_varlen_func"
@@ -89,6 +93,9 @@ class Paged(Sites):
     """
 
     names = ("lse", "scores", "probs")
+    axes = {"lse": ("query", "heads"), "scores": ("query", "heads", "key"), "probs": ("query", "heads", "key")}
+    #: vLLM shards the query projection by head: rank ``r`` of ``n`` holds heads ``[r * heads / n, (r + 1) * heads / n)``.
+    layout = {"tp": {"heads": SPLIT}}
     narrowed = True
 
     def __init__(self, bound: dict[str, Any], lse: torch.Tensor) -> None:
@@ -102,6 +109,15 @@ class Paged(Sites):
         #: ``[heads, total query rows]`` fp32, as the kernel returns it.
         self.exported: torch.Tensor = lse.detach()
         self.batch: Batch | None = None
+        from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+
+        world = get_tensor_model_parallel_world_size()
+        if world > 1:
+            self.ranks = Ranks("tp", world, get_tensor_model_parallel_rank(), tensor_model_parallel_all_reduce)
+
+    def local(self, axis: str) -> int:
+        return self.q.shape[1]
 
     def read(self, site: str, spec: dict[str, Any], batch: Batch | None) -> tuple[torch.Tensor, Provenance]:
         self.batch = batch
@@ -120,8 +136,7 @@ class Paged(Sites):
             )
         return self.spans.index(start), start, size
 
-    def _axes(self, spec: dict[str, Any], site: str, allowed: tuple[str, ...]) -> tuple:
-        sites.check_axes(spec, site, allowed)
+    def _axes(self, spec: dict[str, Any]) -> tuple:
         index, start, size = self._request()
         device = self.q.device
         keys = self.used[index]
@@ -149,19 +164,19 @@ class Paged(Sites):
         return scores
 
     def lse(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
-        _, start, _, _, heads, rows, _ = self._axes(spec, "lse", ("query", "heads"))
+        _, start, _, _, heads, rows, _ = self._axes(spec)
         provenance = Provenance("exact export", NAME, "the kernel's own per-row logsumexp, fp32")
         return sites.squeeze(self._lse(start, heads, rows), spec, {"query": 0, "heads": 1}), provenance
 
     def scores(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
-        index, start, size, keys, heads, rows, cols = self._axes(spec, "scores", ("query", "heads", "key"))
+        index, start, size, keys, heads, rows, cols = self._axes(spec)
         sites.warn_if_large((len(rows), len(heads), len(cols)), "scores", "query=, heads= or key=")
         scores = self._scores(index, start, size, keys, heads, rows, cols)
         provenance = Provenance("exact reconstruction", NAME, "q . k * scale in fp32 from the kernel's query rows and the request's cached keys")
         return sites.squeeze(scores, spec, {"query": 0, "heads": 1, "key": 2}), provenance
 
     def probs(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
-        index, start, size, keys, heads, rows, cols = self._axes(spec, "probs", ("query", "heads", "key"))
+        index, start, size, keys, heads, rows, cols = self._axes(spec)
         sites.warn_if_large((len(rows), len(heads), len(cols)), "probs", "query=, heads= or key=")
         probs = torch.exp(self._scores(index, start, size, keys, heads, rows, cols) - self._lse(start, heads, rows).unsqueeze(-1))
         provenance = Provenance("exact reconstruction", NAME, "exp(scores - lse) in fp32, the kernel backward's own formula")

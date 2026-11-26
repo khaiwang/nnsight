@@ -111,21 +111,21 @@ class Eager(Attention):
 
     def lse(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
         self._replayable("lse")
-        heads, kv_heads, rows, _ = self._axes(spec, "lse", ("heads", "query"))
+        heads, kv_heads, rows, _ = self._axes(spec)
         lse = torch.logsumexp(self._scores(heads, kv_heads, rows, slice(None)), dim=-1)
         note = self._note(f"logsumexp of fp32 scores computed beside the call, which keeps its scores in {self.q.dtype}")
         return sites.squeeze(lse, spec, {"heads": 1, "query": 2}), Provenance("replay", self.name, note)
 
     def scores(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
         self._replayable("scores")
-        heads, kv_heads, rows, cols = self._axes(spec, "scores", ("heads", "query", "key"))
+        heads, kv_heads, rows, cols = self._axes(spec)
         sites.warn_if_large(self._shape(heads, rows, cols), "scores", "heads=, query= or key=")
         scores = self._scores(heads, kv_heads, rows, cols)
         note = self._note(f"q . k * scale in fp32 from the call's inputs, mask added; the call keeps its scores in {self.q.dtype}")
         return sites.squeeze(scores, spec, {"heads": 1, "query": 2, "key": 3}), Provenance("replay", self.name, note)
 
     def probs(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
-        heads, _, rows, cols = self._axes(spec, "probs", ("heads", "query", "key"))
+        heads, _, rows, cols = self._axes(spec)
         # Clone so in-place edits by the caller do not mutate the module's returned weights.
         probs = sites.select(sites.select(sites.select(self.weights, 1, heads), 2, rows), 3, cols).clone()
         note = f"the attention weights the call returned and multiplied with the values, {self.weights.dtype}"

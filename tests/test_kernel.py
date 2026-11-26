@@ -254,6 +254,60 @@ class TestIndexing:
                 envoy.kernel.probs()
 
 
+class TestSplitAxes:
+    """A reader whose axis is split across ranks is asked for local positions, and the ranks' pieces are summed."""
+
+    class Blocks(sites.Sites):
+        names = ("grid",)
+        axes = {"grid": ("rows", "bands", "cols")}
+        lead = 1
+        layout = {"mp": {"bands": sites.SPLIT}}
+
+        def __init__(self, piece: torch.Tensor, ranks: sites.Ranks) -> None:
+            self.piece = piece
+            self.ranks = ranks
+
+        def local(self, axis: str) -> int:
+            return self.piece.shape[2]
+
+        def grid(self, spec):
+            value = self.piece
+            for dim, name in enumerate(self.axes["grid"], 1):
+                value = sites.select(value, dim, sites.indices(spec.get(name), value.shape[dim]))
+            return sites.squeeze(value, spec, {"rows": 1, "bands": 2, "cols": 3}), Provenance("exact export", "blocks", "")
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            {},
+            {"bands": 4},
+            {"bands": -1, "rows": 1},
+            {"bands": [5, 0, 3], "cols": slice(1, 3)},
+            {"bands": slice(1, 5), "rows": 0, "cols": -1},
+            {"bands": [0, 1]},
+        ],
+    )
+    def test_ranks_together_return_the_logical_selection(self, spec):
+        whole = torch.arange(2 * 3 * 6 * 4, dtype=torch.float32).reshape(2, 3, 6, 4) + 1
+        world = 3
+        pieces = []
+        for rank, piece in enumerate(whole.chunk(world, 2)):
+            reader = self.Blocks(piece, sites.Ranks("mp", world, rank, lambda tensor: tensor))
+            pieces.append(reader.read("grid", spec, None)[0])
+        expected = whole
+        for dim, name in zip((3, 2, 1), ("cols", "bands", "rows")):
+            if name in spec:
+                chosen = spec[name]
+                expected = expected.select(dim, chosen) if isinstance(chosen, int) else expected[(slice(None),) * dim + (chosen,)]
+        assert all(piece.shape == expected.shape for piece in pieces)
+        assert torch.equal(sum(pieces), expected)
+
+    def test_an_index_past_the_logical_size_is_refused(self):
+        reader = self.Blocks(torch.zeros(1, 2, 2, 2), sites.Ranks("mp", 3, 0, lambda tensor: tensor))
+        with pytest.raises(IndexError, match="axis of size 6"):
+            reader.read("grid", {"bands": 6}, None)
+
+
 class TestOrdering:
     def test_request_after_module_output_raises_out_of_order(self, x):
         envoy = Envoy(Mixer())

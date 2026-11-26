@@ -486,14 +486,78 @@ a locator for a function read as an attribute, and
 `kernel.register_catalog(catalog, context)` registers the rows. A row appended
 to the transformers `CATALOG` applies to models constructed afterward.
 
+## The reader contract: axes and their layout across ranks
+
+A serve function returns a reader, a subclass of
+`nnsight.intervention.sites.Sites`. The reader declares what a caller can index
+and how each of those axes is laid out when the model is split across ranks.
+`Sites.read` does the index translation and the collective from these
+declarations, so a site method is written once, for one rank.
+
+| Declaration | Meaning |
+|---|---|
+| `names` | The site names. |
+| `axes` | Site name to the axes a caller can index, in the order they appear in the value. An unknown keyword raises `ValueError` before the site method runs. |
+| `lead` | Number of dimensions before the first named axis: 1 for a value with a batch dimension, 0 for vLLM's flat rows. |
+| `layout` | Parallel mode (`"tp"`) to axis name to layout. An axis not listed is `WHOLE`. |
+| `ranks` | Set on a reader whose call ran split across ranks: `Ranks(mode, world, rank, reduce)`, where `reduce` sums a tensor over the ranks. `None` otherwise. |
+| `local(axis)` | The length of a `SPLIT` axis on this rank. |
+
+The layouts:
+
+| Layout | What each rank holds | What `read` does |
+|---|---|---|
+| `WHOLE` | The full axis, with the same values on every rank. | Passes the caller's index through. |
+| `SPLIT` | One contiguous block of `local(axis)` positions, in rank order. | Maps each requested position to its owner rank and local index, asks the site method for this rank's positions, places them into zeros of the requested shape, and sums the ranks with `ranks.reduce`. |
+
+Indices are logical on every runtime: `heads=9` is head 9 of the model, whether
+one process holds all heads or eight ranks hold a block each. With 14 heads on
+two ranks, `probs(query=-1, heads=[3, 9])` runs as:
+
+| | rank 0 | rank 1 |
+|---|---|---|
+| heads held | 0 to 6 | 7 to 13 |
+| requested heads owned | 3 | 9 |
+| local index passed to the site method | 3 | 2 |
+| output position filled | 0 | 1 |
+
+Each rank then holds one filled row and one row of zeros, and one sum over the
+ranks gives both rows on every rank. The payload of the collective is the
+requested slice, so a single-row request stays a single row.
+
+What a site method must do:
+
+- Return the value for the indices in `spec`, with every named axis present in
+  declared order after `lead` dimensions, and squeeze an axis indexed by one int.
+- Accept an empty tuple for a `SPLIT` axis and return a value of length 0 along
+  it. A rank that owns none of the requested positions is asked for that.
+- Never branch on rank. `read` runs the collective on every rank whatever the
+  rank owns, which keeps the ranks in step. A site read must not sit under
+  control flow that differs between ranks, the same condition as an ad-hoc call
+  of a sharded module ([tensor-parallel](../models/tensor-parallel.md)).
+
+What each served reader declares:
+
+| Reader | Sites and axes | `lead` | Layout under tensor parallelism |
+|---|---|---|---|
+| vLLM paged FlashAttention (`modeling/vllm/kernel.py`) | `lse` [query, heads]; `scores`, `probs` [query, heads, key] | 0 | heads `SPLIT`; query and key `WHOLE` |
+| `scaled_dot_product_attention`, eager and FlashAttention 2 in transformers (`intervention/attention.py`) | `lse` [heads, query]; `scores`, `probs` [heads, query, key] | 1 | not declared: `heads=` indexes this rank's heads |
+| Recurrent scans in transformers (`modeling/kernels/recurrent.py`) | `chunk_states` [chunks, heads]; `states` [tokens, heads] | 1 | all `WHOLE` |
+| Experts forwards in transformers (`modeling/kernels/experts.py`) | per-pair rows [tokens, slot], with `expert=` selecting in place of `slot` | none | not served |
+
+The layouts still to add, and the kernels that need them, are listed in the
+[kernel support map](../developing/kernel-support-map.md#axes-and-layout-across-ranks).
+
 ## Limits
 
 - **Reads only:** A site cannot be assigned to. To modify attention scores, add
   a bias to the mask the module passes to the kernel, or edit `q` and `k` before
   the call ([access-and-modify](access-and-modify.md)).
-- **Tensor parallelism:** Under tensor parallelism, each rank holds `heads / tp`
-  query heads, and `heads=` indexes the local rank's heads; rank 0 returns its
-  own share without a gather
+- **Tensor parallelism:** On vLLM, attention sites return every head
+  ([the reader contract](#the-reader-contract-axes-and-their-layout-across-ranks)).
+  On a transformers model, each rank holds `heads / tp` query heads, and
+  `heads=` indexes the local rank's heads; rank 0 returns its own share without
+  a gather
   ([tensor-parallel](../models/tensor-parallel.md#what-is-not-supported)).
   Recurrent sites are full on every rank because transformers gathers the
   projections before calling the kernel.

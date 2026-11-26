@@ -118,6 +118,8 @@ class Recurrence(Sites):
     """
 
     names = ("chunk_states", "states")
+    axes = {"chunk_states": ("chunks", "heads"), "states": ("tokens", "heads")}
+    lead = 1
 
     def __init__(
         self,
@@ -154,7 +156,6 @@ class Recurrence(Sites):
         return sites.squeeze(value, spec, {"heads": 2, axis: 1}).clone()
 
     def chunk_states(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
-        sites.check_axes(spec, "chunk_states", ("chunks", "heads"))
         positions = sites.offsets(spec.get("chunks"), self.count)
         value = self._stack([self._boundary(i) for i in positions], spec, "chunks")
         kept = f"kept in {self.boundaries.dtype}" if self.boundaries.dtype is not torch.float32 else "fp32"
@@ -166,7 +167,6 @@ class Recurrence(Sites):
         return value, Provenance("exact export", self.op_name, note)
 
     def states(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
-        sites.check_axes(spec, "states", ("tokens", "heads"))
         positions = sites.offsets(spec.get("tokens"), self.length)
         sites.warn_if_large((self.boundaries.shape[0], len(positions), *self.boundaries.shape[2:]), "states", "tokens=, heads=")
         by_chunk: dict[int, set[int]] = {}

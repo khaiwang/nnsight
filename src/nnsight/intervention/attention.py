@@ -139,6 +139,8 @@ class Attention(Sites):
     """Site reader for a captured `scaled_dot_product_attention` call."""
 
     names = ("lse", "scores", "probs")
+    axes = {"lse": ("heads", "query"), "scores": ("heads", "query", "key"), "probs": ("heads", "query", "key")}
+    lead = 1
 
     def __init__(self, bound: dict[str, Any], capture: _Capture) -> None:
         self.q: torch.Tensor = bound["query"].detach()
@@ -190,9 +192,8 @@ class Attention(Sites):
             return f"{formula}; dropout_p={self.dropout} is applied after these probabilities"
         return formula
 
-    def _axes(self, spec: dict[str, Any], site: str, allowed: tuple[str, ...]) -> tuple:
+    def _axes(self, spec: dict[str, Any]) -> tuple:
         """Resolve query heads, corresponding KV heads, query row indices, and key column indices from ``spec``."""
-        sites.check_axes(spec, site, allowed)
         device = self.q.device
         heads = sites.positions(sites.indices(spec.get("heads"), self.q.shape[1], device), self.q.shape[1], device)
         kv_heads = heads // (self.q.shape[1] // self.k.shape[1])
@@ -249,19 +250,19 @@ class Attention(Sites):
         )
 
     def lse(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
-        heads, kv_heads, rows, _ = self._axes(spec, "lse", ("heads", "query"))
+        heads, kv_heads, rows, _ = self._axes(spec)
         lse, provenance = self._lse(heads, kv_heads, rows)
         return sites.squeeze(lse, spec, {"heads": 1, "query": 2}), provenance
 
     def scores(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
-        heads, kv_heads, rows, cols = self._axes(spec, "scores", ("heads", "query", "key"))
+        heads, kv_heads, rows, cols = self._axes(spec)
         sites.warn_if_large(self._shape(heads, rows, cols), "scores", "heads=, query= or key=")
         scores = self._scores(heads, kv_heads, rows, cols)
         provenance = Provenance("exact reconstruction", self.op_name, self._note("q . k * scale in fp32 from the kernel's inputs, mask added"))
         return sites.squeeze(scores, spec, {"heads": 1, "query": 2, "key": 3}), provenance
 
     def probs(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
-        heads, kv_heads, rows, cols = self._axes(spec, "probs", ("heads", "query", "key"))
+        heads, kv_heads, rows, cols = self._axes(spec)
         sites.warn_if_large(self._shape(heads, rows, cols), "probs", "heads=, query= or key=")
         lse, lse_provenance = self._lse(heads, kv_heads, rows)
         probs = torch.exp(self._scores(heads, kv_heads, rows, cols) - lse.unsqueeze(-1))

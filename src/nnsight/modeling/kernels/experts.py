@@ -75,6 +75,8 @@ class Experts(Sites):
     """Site reader holding the captured per-pair buffers of one experts forward pass."""
 
     names = tuple(_ROWS)
+    #: ``expert=`` selects one expert's rows in place of the ``slot`` axis.
+    axes = dict.fromkeys(_ROWS, ("tokens", "slot", "expert"))
 
     def __init__(
         self,
@@ -96,7 +98,7 @@ class Experts(Sites):
         return self._site(site, spec, batch)
 
     def _site(self, name: str, spec: dict[str, Any], batch: Batch | None) -> tuple[torch.Tensor, Provenance]:
-        sites.check_axes(spec, name, ("tokens", "slot", "expert"))
+        sites.check_axes(spec, name, self.axes[name])
         if "slot" in spec and "expert" in spec:
             raise ValueError(f"kernel site {name!r} takes slot= or expert=, not both")
         tokens, top_k = self.top_k_index.shape

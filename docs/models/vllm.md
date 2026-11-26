@@ -432,7 +432,12 @@ A call the reconstruction does not model raises `ValueError` with the reason
 at the request: a sliding window, ALiBi, a logit soft cap, attention sinks, a
 custom mask, an fp8 KV cache, or a step vLLM computes with cascade or
 context-parallel attention (several kernel calls merged into one).
-The sites are validated on one GPU. They are not served under `taps` or on other
+Under tensor parallelism each rank's kernel call holds a block of the heads.
+A site still returns every head, and `heads=` indexes the model's heads: each
+rank fills the heads it holds and one sum over the ranks assembles the value
+([the reader contract](../usage/kernel.md#the-reader-contract-axes-and-their-layout-across-ranks)).
+On Qwen2.5-0.5B at `tensor_parallel_size=2`, layer 0 equals the one-rank values
+to 1e-5. The sites are not served under `taps` or on other
 attention backends (Triton, FlashInfer, MLA).
 
 ## CUDA graphs with taps

@@ -32,6 +32,28 @@ that records how the value was obtained:
 This module also provides the shared slicing helpers (`indices`, `select`,
 `positions`, `offsets`, `squeeze`, `check_axes`, `warn_if_large`) so all site
 families apply the same indexing rules to their axis keywords.
+
+## Axes and their layout across ranks
+
+A reader declares, per site, the named axes a caller can index (``axes``), in
+the order they appear in the value after ``lead`` leading dimensions. Indices
+are always logical: ``heads=9`` is the model's head 9 on one device and on
+eight.
+
+On a model split across ranks, a reader also declares how each axis is laid out
+(``layout``, per parallel mode) and sets ``ranks`` on the readers of a call that
+ran in that mode:
+
+* `WHOLE` (the default): every rank holds the full axis with the same values.
+* `SPLIT`: each rank holds one contiguous block of equal length, in rank order.
+
+`Sites.read` translates a request from those declarations. For each `SPLIT` axis
+it maps the requested logical positions to this rank's local ones, asks the
+site method for that local slice, places it into zeros of the requested shape,
+and sums the ranks' pieces with one collective. A site method therefore only
+ever answers for local indices, and never branches on rank. The collective runs
+on every rank whatever it owns, so the ranks stay in step as long as the read is
+not under rank-dependent control flow.
 """
 
 from __future__ import annotations
@@ -78,6 +100,24 @@ class Provenance(NamedTuple):
 torch.serialization.add_safe_globals([Provenance])
 
 
+#: Axis layouts across ranks; see the module docstring.
+WHOLE = "whole"
+SPLIT = "split"
+
+
+class Ranks(NamedTuple):
+    """The rank group a kernel call ran in, set on a reader whose call was distributed."""
+
+    #: Parallel mode, a key of the reader's ``layout`` (``"tp"``).
+    mode: str
+    #: Number of ranks in the group.
+    world: int
+    #: This process's rank.
+    rank: int
+    #: Sums a tensor of one shape over the group's ranks and returns the sum on each.
+    reduce: Callable[[torch.Tensor], torch.Tensor]
+
+
 class Batch(NamedTuple):
     """Row range belonging to the requesting worker within the trace's combined batch."""
 
@@ -107,13 +147,49 @@ class Sites:
     """
 
     names: tuple[str, ...] = ()
+    #: Site name -> the axes a caller can index, in the order they appear in the value.
+    axes: dict[str, tuple[str, ...]] = {}
+    #: Number of dimensions before the first named axis (1 for a value with a batch dimension).
+    lead: int = 0
+    #: Parallel mode -> axis name -> layout. An axis not listed is `WHOLE`.
+    layout: dict[str, dict[str, str]] = {}
+    #: The rank group this call ran in, or ``None`` when every axis is whole on this process.
+    ranks: Ranks | None = None
     #: True when `read` already returns only the requesting worker's rows, so `Kernel._request` does not narrow the value again.
     narrowed: bool = False
 
     def read(self, site: str, spec: dict[str, Any], batch: Batch | None) -> tuple[torch.Tensor, Provenance]:
         if site not in self.names:
             raise ValueError(f"this kernel has no site {site!r}; available: {', '.join(self.names)}")
-        return getattr(self, site)(spec)
+        names = self.axes[site]
+        check_axes(spec, site, names)
+        ranks = self.ranks
+        split = [] if ranks is None else [name for name in names if self.layout[ranks.mode].get(name, WHOLE) == SPLIT]
+        if not split:
+            return getattr(self, site)(spec)
+        # Ask the site for the positions this rank holds, in local indices.
+        local = dict(spec)
+        placed = []
+        for name in split:
+            size = self.local(name)
+            wanted = offsets(spec.get(name), size * ranks.world)
+            mine = [(out, position - ranks.rank * size) for out, position in enumerate(wanted) if position // size == ranks.rank]
+            local[name] = tuple(index for _, index in mine)
+            placed.append((name, [out for out, _ in mine], len(wanted)))
+        value, provenance = getattr(self, site)(local)
+        # Put them where the request wants them, among zeros for the other ranks' positions, and sum the ranks.
+        dims = {}
+        for name, outs, count in placed:
+            earlier = names[: names.index(name)]
+            dim = dims[name] = self.lead + len(earlier) - sum(isinstance(local.get(other), int) for other in earlier)
+            shape = list(value.shape)
+            shape[dim] = count
+            value = value.new_zeros(shape).index_copy_(dim, torch.tensor(outs, dtype=torch.long, device=value.device), value)
+        return squeeze(ranks.reduce(value), spec, dims), provenance
+
+    def local(self, axis: str) -> int:
+        """Length of a `SPLIT` axis on this rank. A reader that declares one implements this."""
+        raise NotImplementedError(f"{type(self).__name__} declares {axis!r} as split and does not give its local length")
 
 
 class Unavailable(Sites):
