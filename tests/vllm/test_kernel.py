@@ -19,9 +19,9 @@ LAYER = 0
 @pytest.fixture(scope="module")
 def reference():
     """HF gpt2 in vLLM's dtype: its SDPA site's ``probs`` for a prompt, as ``[queries, heads, keys]``."""
-    from nnsight import LanguageModel
+    from nnsight import TransformersModel
 
-    model = LanguageModel("gpt2", device_map="cuda", dtype=torch.bfloat16, dispatch=True)
+    model = TransformersModel("openai-community/gpt2", task="text-generation", device="cuda", dtype=torch.bfloat16, dispatch=True)
 
     def probs(prompt: str) -> torch.Tensor:
         with model.trace(prompt):
