@@ -584,6 +584,15 @@ On an engine built with `taps`, name the site as
 `"backbone.layers.*.mixer.kernel"`. Layers 0 and 7 then equal the eager engine
 exactly.
 
+A Mamba1 layer (Mamba, Jamba) is served at the same location. Its prefill
+kernel is one fused scan that writes only each request's final state, so a
+request is one chunk: `chunk_states` is the state the request entered with and
+its final state, and the other tokens of `states` are advanced from the
+entering state in fp32 (`"derived"`). A Mamba1 state is `[channels, state]`
+and `heads=` indexes the channels. On mamba-130m the states of four tokens of
+a 73-token prompt are within 0.6% (layer 0) and 2% (layer 5) of the
+transformers sites in fp32.
+
 Not served: the ReplaySSM decode path and speculative decoding.
 
 ## Expert kernel sites

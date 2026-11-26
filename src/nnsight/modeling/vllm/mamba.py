@@ -1,4 +1,4 @@
-"""Recurrent kernel sites on vLLM's Mamba2 layers (Mamba2, Nemotron-H, Jamba, Granite hybrid, Falcon-H1, Zamba2).
+"""Recurrent kernel sites on vLLM's Mamba2 and Mamba1 layers (Mamba2, Nemotron-H, Granite hybrid, Falcon-H1, Zamba2; Mamba, Jamba).
 
 vLLM's ``MambaMixer2`` runs its state-space recurrence in ``conv_ssm_forward``,
 once per step for every scheduled request, and keeps each request's state in a
@@ -31,6 +31,14 @@ prefill strip has a shorter first chunk. ``states`` does not depend on the cut.
 Under tensor parallelism each rank's layer holds ``num_heads // tp_size`` heads
 and their states, so ``heads`` is `SPLIT`.
 
+A Mamba1 layer (``MambaMixer``) is served the same way from ``forward_impl``.
+Its prefill kernel, ``selective_scan_fn``, is one fused scan that writes only
+each request's final state into the cache. A request is therefore one chunk:
+``chunk_states`` is the state it entered with and its final state, and every
+other token of ``states`` is advanced from the entering state in fp32 with
+``S_t = exp(dt_t A) S_{t-1} + (dt_t u_t) B_t^T``. A Mamba1 state is
+``[channels, state]``, and ``heads=`` indexes the channels, as on transformers.
+
 Not served: the ReplaySSM decode path and speculative decoding.
 """
 
@@ -49,6 +57,7 @@ from ...intervention.source import arguments
 from ..kernels.recurrent import Recurrence
 
 NAME = "MambaMixer2.conv_ssm_forward"
+FIRST = "MambaMixer.forward_impl"
 
 
 class _Capture(threading.local):
@@ -68,10 +77,34 @@ def _install() -> None:
     with _lock:
         if _installed:
             return
+        from vllm.model_executor.layers.mamba import mamba_mixer as first
         from vllm.model_executor.layers.mamba import mamba_mixer2 as layer
         from vllm.model_executor.layers.mamba.ops import ssd_combined
 
         scan, passing, update = layer.mamba_chunk_scan_combined_varlen, ssd_combined._state_passing_fwd, layer.selective_state_update
+        whole = first.selective_scan_fn
+
+        def recording_whole(*args: Any, **kwargs: Any) -> Any:
+            calls = _capture.calls
+            if calls is None:
+                return whole(*args, **kwargs)
+            bound = arguments(whole, args, kwargs)
+            cache, slots, starts = bound["ssm_states"], bound["cache_indices"], bound["query_start_loc"]
+            # One cache slot per request: the layout without prefix caching.
+            if slots is None or slots.dim() != 1 or starts is None:
+                calls.append({"kind": "unsupported"})
+                return whole(*args, **kwargs)
+            slots = slots.long()
+            entering = cache[slots].clone()
+            if bound["has_initial_state"] is not None:
+                entering = torch.where(bound["has_initial_state"][:, None, None].bool(), entering, 0)
+            else:
+                entering.zero_()
+            # The kernel overwrites its input rows with its output, so the step's inputs are copied first.
+            inputs = {name: bound[name].clone() for name in ("u", "delta", "B")}
+            output = whole(*args, **kwargs)
+            calls.append({"kind": "whole", **bound, **inputs, "entering": entering, "final": cache[slots].clone()})
+            return output
 
         def recording_scan(*args: Any, **kwargs: Any) -> Any:
             calls = _capture.calls
@@ -108,6 +141,8 @@ def _install() -> None:
         layer.mamba_chunk_scan_combined_varlen = recording_scan
         ssd_combined._state_passing_fwd = recording_passing
         layer.selective_state_update = recording_update
+        first.selective_state_update = recording_update
+        first.selective_scan_fn = recording_whole
         _installed = True
 
 
@@ -128,9 +163,46 @@ def serve(fn: Callable, args: tuple, kwargs: dict) -> tuple[Any, Sites]:
         return output, Unavailable(f"{NAME} ran without attention metadata; its kernel sites are not served on this call")
     if layer.use_replayssm or layer.num_spec > 0:
         return output, Unavailable(f"{NAME}: kernel sites are not served on the ReplaySSM decode path or under speculative decoding")
+    return output, _reader(calls, metadata)
+
+
+def serve_first(fn: Callable, args: tuple, kwargs: dict) -> tuple[Any, Sites]:
+    """Run a Mamba1 layer's ``forward_impl`` with its kernels recording, and hand back a `Scan` over what they did."""
+    from vllm.forward_context import get_forward_context
+
+    _install()
+    outer, _capture.calls = _capture.calls, (calls := [])
+    try:
+        output = fn(*args, **kwargs)
+    finally:
+        _capture.calls = outer
+    metadata = get_forward_context().attn_metadata
+    metadata = metadata.get(args[0].prefix) if isinstance(metadata, dict) else None
+    if metadata is None:
+        return output, Unavailable(f"{FIRST} ran without attention metadata; its kernel sites are not served on this call")
+    return output, _reader(calls, metadata)
+
+
+def _reader(calls: list[dict[str, Any]], metadata: Any) -> Sites:
     if any(call["kind"] == "unsupported" for call in calls):
-        return output, Unavailable(f"{NAME}: the decode kernel advanced more than one token per request; its kernel sites are not served on this call")
-    return output, Scan({call["kind"]: call for call in calls}, metadata.num_decode_tokens)
+        return Unavailable("the layer's kernels ran in a layout these kernel sites do not cover (more than one token or cache slot per request)")
+    return Scan({"scan" if call["kind"] == "whole" else call["kind"]: call for call in calls}, metadata.num_decode_tokens)
+
+
+def _step_first(call: dict[str, Any], tokens: slice) -> Callable[[torch.Tensor, int], torch.Tensor]:
+    """A Mamba1 layer's fp32 recurrence over one request's columns of a scan call: ``S_t = exp(dt_t A) S_{t-1} + (dt_t u_t) B_t^T``."""
+    u, inputs = call["u"][:, tokens].float(), call["B"].reshape(-1, call["B"].shape[-1])[:, tokens].float()
+    dt = call["delta"][:, tokens].float()
+    if call["delta_bias"] is not None:
+        dt = dt + call["delta_bias"].float()[:, None]
+    if call["delta_softplus"]:
+        dt = F.softplus(dt)
+    A = call["A"].float()
+
+    def step(state: torch.Tensor, t: int) -> torch.Tensor:
+        return state * torch.exp(dt[:, t, None] * A) + (dt[:, t] * u[:, t])[:, None] * inputs[:, t][None, :]
+
+    return step
 
 
 def _step(call: dict[str, Any], tokens: slice) -> Callable[[torch.Tensor, int], torch.Tensor]:
@@ -165,7 +237,7 @@ class Scan(Sites):
 
     def local(self, axis: str) -> int:
         call = next(iter(self.calls.values()))
-        return (call["before"] if call["kind"] == "update" else call["x"]).shape[1]
+        return (call["before"] if call["kind"] == "update" else call["entering"] if call["kind"] == "whole" else call["x"]).shape[1]
 
     def read(self, site: str, spec: dict[str, Any], batch: Batch | None) -> tuple[torch.Tensor, Provenance]:
         self.batch = batch
@@ -185,7 +257,8 @@ class Scan(Sites):
                 raise ValueError(f"kernel sites: the worker's rows [{start}, {start + (size or 0)}) are not one decoding request's row in this call")
             return [0, 1], torch.stack([call["before"][start], call["after"][start]]), None
         call = self.calls["scan"]
-        starts, cuts, first = call["cu_seqlens"].tolist(), call["cu_chunk_seqlens"].tolist(), start - self.decoding
+        whole = call["kind"] == "whole"
+        starts, first = call["query_start_loc" if whole else "cu_seqlens"].tolist(), start - self.decoding
         if size is None:
             if len(starts) != 2:
                 raise ValueError(f"{NAME} prefilled {len(starts) - 1} requests in one call and the trace has no batcher to tell them apart")
@@ -193,6 +266,10 @@ class Scan(Sites):
         if first not in starts[:-1] or starts[starts.index(first) + 1] != first + size:
             raise ValueError(f"kernel sites: the worker's rows [{start}, {start + size}) are not one request's rows in this call (prefill boundaries {starts}, after {self.decoding} decoding rows)")
         request = starts.index(first)
+        if whole:
+            # One fused scan per request: the state it entered with, and its final state.
+            return [0, size], torch.stack([call["entering"][request], call["final"][request]]), _step_first(call, slice(first, first + size))
+        cuts = call["cu_chunk_seqlens"].tolist()
         chunks = [index for index, cut in enumerate(cuts[:-1]) if first <= cut < first + size]
         ends = call["ends"][chunks[0] : chunks[-1] + 1].unflatten(-1, call["x"].shape[-1:] + (-1,))
         initial = call["initial_states"]
@@ -241,6 +318,16 @@ def conv_ssm_forward(context: None) -> Located:
     yield unshimmed(MambaMixer2.conv_ssm_forward), (Attr(MambaMixer2, "conv_ssm_forward"),)
 
 
+def forward_impl(context: None) -> Located:
+    """Locate ``MambaMixer.forward_impl``, which the Mamba1 layer's custom op reads off the layer on every call."""
+    try:
+        from vllm.model_executor.layers.mamba.mamba_mixer import MambaMixer
+    except ImportError:  # a vLLM without this layer
+        return
+    yield unshimmed(MambaMixer.forward_impl), (Attr(MambaMixer, "forward_impl"),)
+
+
 CATALOG: list[Spec] = [
     Spec(NAME, "recurrent", conv_ssm_forward, serve),
+    Spec(FIRST, "recurrent", forward_impl, serve_first),
 ]

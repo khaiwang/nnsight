@@ -97,3 +97,50 @@ def test_decode_steps_continue_each_request(engine):
             assert torch.equal(last, chunks[-1].float())
             if index:
                 assert torch.equal(chunks[0], steps[index - 1][0][-1])
+
+
+# ---------------------------------------------------------------------------
+# Mamba1 (mamba-130m): one fused scan per request, so a request is one chunk
+# ---------------------------------------------------------------------------
+
+FIRST = "state-spaces/mamba-130m-hf"
+MEDIUM = "The Eiffel Tower is located in the city of Paris and " * 6
+
+
+@pytest.fixture(scope="module")
+def first_engine():
+    from nnsight.modeling.vllm import VLLM
+
+    return VLLM(FIRST, gpu_memory_utilization=0.2, dispatch=True)
+
+
+def test_mamba1_states_match_hf(first_engine):
+    from nnsight import TransformersModel
+
+    kernel = first_engine.backbone.layers[0].mixer.kernel
+    with first_engine.trace(temperature=0.0, max_tokens=3) as tracer:
+        with tracer.invoke(SHORT):
+            other = kernel.chunk_states().shape.save()
+        with tracer.invoke(MEDIUM):
+            steps = list().save()
+            for _ in tracer.iter[:3]:
+                steps.append((kernel.chunk_states().clone(), kernel.states().clone()))
+    count = steps[0][1].shape[0]
+    tokens = [0, 10, count // 2, count - 1]
+    reference = TransformersModel(FIRST, task="text-generation", device="cuda", dtype=torch.float32, dispatch=True)
+    with reference.trace(MEDIUM):
+        expected = reference.backbone.layers[0].mixer.kernel.states(tokens=tokens).save()
+    # A Mamba1 state is [channels, state]; a request is one chunk: the state it entered with and its final state.
+    assert tuple(other) == (2, 1536, 16)
+    assert [tuple(chunks.shape) for chunks, _ in steps] == [(2, 1536, 16)] * 3
+    assert [states.shape[0] for _, states in steps] == [count, 1, 1]
+    assert (steps[0][0][0] == 0).all()
+    assert _relative_channels(steps[0][1][tokens], expected[0].float().cpu()) < 2e-2
+    for index, (chunks, states) in enumerate(steps):
+        assert torch.equal(states[-1], chunks[-1].float())
+        if index:
+            assert torch.equal(chunks[0], steps[index - 1][0][-1])
+
+
+def _relative_channels(value, expected):
+    return float(((value.float().cpu() - expected).abs().amax((-1, -2)) / expected.abs().amax((-1, -2))).max())
