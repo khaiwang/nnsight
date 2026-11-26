@@ -150,6 +150,40 @@ TIPS v2) are registered and served the same way. Drilling into the eager
 function's body with `.source` takes precedence on that call, as for every
 registered kernel ([below](#recurrent-states-of-a-chunked-kernel)).
 
+### Under FlashAttention 2
+
+Under `attn_implementation="flash_attention_2"`, every attention module calls
+transformers' `_flash_attention_forward` with the padded `[batch, length]`
+inputs and the padding mask. For a padded batch that function removes the
+padding, joins the rows into one packed strip of tokens, calls the
+FlashAttention kernel on the strip, and pads the result back. The sites are
+read at `_flash_attention_forward`, where the batch rows still exist, and take
+the kernel's logsumexp from the kernel call underneath. The three sites
+therefore have the same `[batch, heads, queries, keys]` layout, values and
+provenance as under SDPA, and batch rows split between invokes in the same way:
+
+```python
+model = LanguageModel("meta-llama/Llama-3.2-1B", attn_implementation="flash_attention_2", dtype=torch.bfloat16, device_map="cuda")
+with model.trace(["Hi", "The Eiffel Tower is in the city of"]):
+    probs = model.model.layers[0].self_attn.kernel.probs().save()   # [2, heads, queries, keys]
+```
+
+- Both the `flash_attn` package and the `kernels-community/flash-attn2` hub
+  kernel are covered.
+- A padding query row has `lse` of `-inf` and `probs` of `0`.
+- Several sequences packed into one batch row through `position_ids` are
+  served as one row whose entries across sequences are masked.
+- With a static cache, transformers trims the keys to the length of the
+  attention mask before the kernel call, so the key axis has that length. Under
+  SDPA the key axis has one column per cache slot.
+- With `flash_attn` 2.3.3 to 2.5.9 the packed kernel returns its logsumexp in
+  a layout that cannot be placed back onto the rows, so on a padded batch `lse`
+  and `probs` are recomputed and carry `kind="replay"`.
+- The read raises a `ValueError` when the kernel is called with a sliding
+  window, a logit soft cap, attention dropout, or any other option that changes
+  the attention; when sequences are packed across several batch rows; and for
+  transformers' continuous batching, which uses a paged kernel.
+
 ## Provenance
 
 Every tensor returned by a kernel site has a `.provenance` attribute holding a
@@ -222,7 +256,9 @@ kernel, the location never fires and the trace ends with `OutOfOrderError:
 - An MLP module, a full decoder block (request `.kernel` on its attention
   submodule instead), or a full MoE block (request `.kernel` on its `experts`
   submodule instead).
-- A model loaded with `attn_implementation="flash_attention_2"`.
+- A model loaded with `attn_implementation="flash_attention_3"` or `"flash_attention_4"`
+  (the read raises a `ValueError` naming the implementation), or a model whose
+  forward is compiled with `torch.compile`.
 - An eager attention module whose forward pass computes attention inline
   instead of calling a module-level `*eager_attention_forward` function, such
   as GPT-2 with `reorder_and_upcast_attn=True` and older architectures (BLOOM,
@@ -423,6 +459,7 @@ rows); the function a Python reference row registers has a different name
 |---|---|---|---|
 | `scaled_dot_product_attention` | attention | `lse`, `scores`, `probs` | The attribute of `torch.nn.functional`, registered when nnsight is imported. |
 | `eager_attention_forward` | attention | `lse`, `scores`, `probs` | Every `*eager_attention_forward` function in the model's modeling modules. |
+| `_flash_attention_forward` | attention | `lse`, `scores`, `probs` | transformers' flash attention function, in the attention interface module and the modeling modules that import it. Serves calls that run FlashAttention 2. |
 | `grouped_mm_experts_forward` | experts | `expert_input`, `expert_activation`, `expert_output` | The `grouped_mm` entry of transformers' experts-implementation mapping. |
 | `batched_mm_experts_forward` | experts | same | The `batched_mm` entry of that mapping. |
 | `chunk_gated_delta_rule` | recurrent | `chunk_states`, `states` | The hub-kernel wrapper of that name, running transformers' Python reference. |

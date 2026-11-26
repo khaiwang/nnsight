@@ -7,12 +7,15 @@ model when a `TransformersModel` is constructed. Because the kernel registry is
 process-wide, a function registered for one model serves every model that reads
 its registered holders.
 
-Models in transformers reach their kernels in three ways, each handled by a
+Models in transformers reach their kernels in four ways, each handled by a
 locator:
 
 * `eager_functions`: under ``attn_implementation="eager"``, an attention module
   passes its modeling module's own ``*eager_attention_forward`` global as the
   default to ``ALL_ATTENTION_FUNCTIONS.get_interface`` on each call.
+* `flash_forward`: under a flash implementation, the attention interface (and
+  a few older modeling modules) calls ``_flash_attention_forward``, held as a
+  module global by each module that imports it.
 * `experts_forward`: the experts wrapper looks up its implementation in
   ``ALL_EXPERTS_FUNCTIONS`` on each call.
 * `hub_kernel`: recurrent kernels are called through
@@ -20,7 +23,7 @@ locator:
   stored in their ``implementation`` closure cell (transformers' Python
   reference or an installed library's kernel).
 
-Site readers live in the sibling modules eager.py, recurrent.py, and experts.py.
+Site readers live in the sibling modules eager.py, flash.py, recurrent.py, and experts.py.
 PyTorch's SDPA has its own single-row catalog in intervention/attention.py.
 
 The hub-kernel wrappers exist from transformers 4.50 and carry the closure
@@ -38,7 +41,7 @@ from typing import Callable, NamedTuple
 import torch
 
 from ...intervention.kernel import Attr, Item, Located, Spec, register_catalog, unshimmed
-from . import eager, experts, recurrent
+from . import eager, experts, flash, recurrent
 
 #: The closure variables of a hub-kernel wrapper that `hub_kernel` reads.
 _WRAPPER_CELLS = frozenset({"func_name", "package", "torch_function", "implementation"})
@@ -106,6 +109,23 @@ def eager_functions(context: Modeling) -> Located:
                 yield fn, ()
 
 
+def flash_forward(context: Modeling) -> Located:
+    """Locate transformers' ``_flash_attention_forward``, held by the attention interface module and by the modeling modules that import it by name.
+
+    Every flash implementation goes through this function; `flash.serve_flash`
+    serves the calls that run FlashAttention 2. A transformers release without
+    ``transformers.integrations.flash_attention`` locates nothing.
+    """
+    try:
+        from transformers import modeling_flash_attention_utils as utils
+        from transformers.integrations import flash_attention
+    except ImportError:
+        return
+    fn = unshimmed(utils._flash_attention_forward)
+    holders = [Attr(module, name) for module in (flash_attention, *context.modules) for name, value in list(vars(module).items()) if unshimmed(value) is fn]
+    yield fn, tuple(holders)
+
+
 def experts_forward(name: str, key: str) -> Callable[[Modeling], Located]:
     """Locate the experts forward ``name``, held at ``key`` of transformers' experts-implementation mapping.
 
@@ -150,6 +170,7 @@ def hub_kernel(name: str, package: str | None = None) -> Callable[[Modeling], Lo
 #: ``"{package}."`` for library kernels); the function a Python reference row registers has a different name.
 CATALOG: list[Spec] = [
     Spec("eager_attention_forward", "attention", eager_functions, eager.serve_eager),
+    Spec("_flash_attention_forward", "attention", flash_forward, flash.serve_flash),
     Spec("grouped_mm_experts_forward", "experts", experts_forward("grouped_mm_experts_forward", "grouped_mm"), experts.serve_grouped_mm),
     Spec("batched_mm_experts_forward", "experts", experts_forward("batched_mm_experts_forward", "batched_mm"), experts.serve_batched_mm),
     Spec("chunk_gated_delta_rule", "recurrent", hub_kernel("chunk_gated_delta_rule"), recurrent.serve_gated_delta_chunk),
