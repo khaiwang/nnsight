@@ -34,12 +34,14 @@ recurrent sites.
 
 from __future__ import annotations
 
+import functools
 import sys
 from types import CellType, FunctionType, ModuleType
-from typing import Callable, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 import torch
 
+from ...intervention import attention
 from ...intervention.kernel import Attr, Item, Located, Spec, register_catalog, unshimmed
 from . import eager, experts, flash, recurrent
 
@@ -185,10 +187,38 @@ CATALOG: list[Spec] = [
 ]
 
 
+def _record_folded_queries() -> None:
+    """Wrap transformers' ``pack_gqa`` once so each tensor it folds is recorded with `attention.fold`.
+
+    From transformers 5.24, ``sdpa_attention_forward`` folds the head groups of
+    a one-token query into the query axis before it calls the kernel, which the
+    attention reader has to undo. A transformers release without ``pack_gqa``
+    folds nothing.
+    """
+    try:
+        from transformers.integrations import sdpa_attention
+    except ImportError:
+        return
+    inner = vars(sdpa_attention).get("pack_gqa")
+    if inner is None or inner.__module__ == __name__:
+        return
+
+    @functools.wraps(inner)
+    def pack_gqa(hidden_states: Any, n_rep: int) -> Any:
+        packed = inner(hidden_states, n_rep)
+        if packed is not None and packed is not hidden_states:
+            attention.fold(packed, n_rep)
+        return packed
+
+    pack_gqa.__module__ = __name__
+    sdpa_attention.pack_gqa = pack_gqa
+
+
 def register_model(root: torch.nn.Module) -> None:
     """Register every function `CATALOG` locates for ``root``.
 
     The experts rows locate their forwards for every model; the other rows locate
     only what ``root``'s modeling modules define.
     """
+    _record_folded_queries()
     register_catalog(CATALOG, modeling(root))

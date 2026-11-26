@@ -62,6 +62,7 @@ and the provenance note records that ``dropout_p`` value.
 
 from __future__ import annotations
 
+import weakref
 from contextlib import contextmanager
 from functools import cached_property
 from typing import Any, Callable, Iterator
@@ -95,6 +96,29 @@ _PARAMETERS = ("query", "key", "value", "attn_mask", "dropout_p", "is_causal", "
 _MASKED = torch.finfo(torch.float16).min
 
 
+#: ``id`` of a live query tensor -> (weak reference to it, the number of head groups folded into its query axis).
+_folded: dict[int, tuple[weakref.ref, int]] = {}
+
+
+def fold(query: torch.Tensor, groups: int) -> None:
+    """Record that ``query`` has ``groups`` head groups folded into its query axis.
+
+    A caller that runs grouped attention on the key/value heads reshapes a
+    one-token query ``[batch, heads, 1, dim]`` to ``[batch, kv_heads, groups, dim]``
+    (transformers' ``pack_gqa``). Whoever does that folding calls this on the
+    folded tensor, and `Attention` unfolds it so the sites keep their head axis.
+    The record is dropped when the tensor is freed.
+    """
+    key = id(query)
+    _folded[key] = (weakref.ref(query, lambda _: _folded.pop(key, None)), groups)
+
+
+def _groups(query: torch.Tensor) -> int:
+    """The number of head groups folded into ``query``'s query axis; 1 for a query nobody folded."""
+    reference, groups = _folded.get(id(query), (None, 1))
+    return groups if reference is not None and reference() is query else 1
+
+
 class _Capture(TorchDispatchMode):
     """Dispatch mode that records the fused SDPA operator, its arguments, and its output."""
 
@@ -121,7 +145,7 @@ def serve(fn: Callable, args: tuple, kwargs: dict) -> tuple[Any, Sites]:
         output = fn(*args, **kwargs)
     if bound["query"].dim() != 4:
         return output, Unavailable(f"kernel sites need [batch, heads, queries, dim] attention inputs; got {bound['query'].dim()} dims")
-    return output, Attention(bound, capture)
+    return output, Attention(bound, capture, _groups(bound["query"]))
 
 
 @contextmanager
@@ -144,11 +168,19 @@ class Attention(Sites):
     #: A column-sharded query projection leaves each rank one block of the heads.
     layout = {"tp": {"heads": sites.SPLIT}}
 
-    def __init__(self, bound: dict[str, Any], capture: _Capture) -> None:
+    def __init__(self, bound: dict[str, Any], capture: _Capture, groups: int = 1) -> None:
         self.q: torch.Tensor = bound["query"].detach()
         self.k: torch.Tensor = bound["key"].detach()
         mask = bound.get("attn_mask")
         self.mask = None if mask is None else mask.detach()
+        #: Head groups the caller folded into the query axis of this call (see `fold`); 1 when it folded none.
+        self.groups = groups
+        if groups > 1:
+            # [batch, kv_heads, groups, ...] back to [batch, heads, 1, ...]: head ``h`` reads key/value head ``h // groups``.
+            folded_shape = tuple(self.q.shape[1:3])
+            self.q = self.q.reshape(self.q.shape[0], -1, 1, self.q.shape[-1])
+            if self.mask is not None and self.mask.dim() == 4 and tuple(self.mask.shape[1:3]) == folded_shape:
+                self.mask = self.mask.reshape(self.mask.shape[0], -1, 1, self.mask.shape[-1])
         self.is_causal = bool(bound.get("is_causal", False))
         scale = bound.get("scale")
         self.scale = self.q.shape[-1] ** -0.5 if scale is None else scale
@@ -187,6 +219,8 @@ class Attention(Sites):
         # the query dimension to a multiple of 32. Trim both to [B, H, Lq].
         if lse.dim() == 4:
             lse = lse.squeeze(-1)
+        if self.groups > 1:
+            return lse[..., : self.groups].reshape(lse.shape[0], -1, 1)
         return lse[..., : self.q.shape[2]]
 
     def _note(self, formula: str) -> str:

@@ -1475,6 +1475,30 @@ def _llama(implementation):
     return module
 
 
+def test_a_one_token_step_on_grouped_heads_keeps_the_head_axis():
+    """A decode step of a model with grouped key-value heads serves ``[batch, heads, 1, keys]``, as the eager sites do.
+
+    From transformers 5.24 the sdpa path folds the head groups of a one-token
+    query into the query axis before it calls the kernel, when the batch is
+    padded and so carries a mask. The prefill step is compared by shape only:
+    the two backends differ on a padding token's query row.
+    """
+    saved = []
+    for implementation in ("sdpa", "eager"):
+        model = _wrap(_llama(implementation))
+        with model.generate(_padded([5, 9, 7], [4, 8]), max_new_tokens=3, do_sample=False) as tracer:
+            steps = nnsight.save([])
+            for _ in tracer.iter[:3]:
+                attn = model.model.layers[1].self_attn
+                steps.append((attn.kernel.probs(), attn.kernel.probs(heads=3, key=slice(1, 4)), attn.kernel.lse(heads=[2, 1])))
+        saved.append(steps)
+    for step, (values, expected) in enumerate(zip(*saved)):
+        assert values[0].shape == (2, 4, 1 if step else 3, 3 + step)
+        assert values[2].shape == (2, 2, 1 if step else 3)
+        for value, reference in zip(values, expected):
+            assert value.shape == reference.shape and (step == 0 or torch.allclose(value, reference, atol=1e-5))
+
+
 def _padded(*prompts):
     """Left-pad lists of token ids (pad token 0) into ``input_ids`` and ``attention_mask``."""
     length = max(map(len, prompts))
