@@ -484,6 +484,11 @@ The sampled tokens are identical. Under `tensor_parallel_size=2` the sites
 assemble the ranks' heads and equal the one-rank engine to within 0.05 (the
 test's bound).
 
+On an engine built with `taps`, name the site as
+`"model.layers.*.self_attn.mla_attn.mla_attn.kernel"`. Layer 0 then equals the
+eager engine to 1e-5 and layer 7 to 2.5% of the largest entry, the drift between
+a replayed graph and eager execution.
+
 Not served: a prefill that continues cached or earlier-chunk context (prefix
 caching or chunked prefill), which vLLM computes as several kernel calls merged
 by logsumexp; the other MLA backends (FlashMLA, FlashInfer, CUTLASS, sparse
@@ -575,8 +580,11 @@ with vLLM in bf16 and transformers in fp32. Under `tensor_parallel_size=2` the
 sites assemble the ranks' heads and equal the one-rank engine to within 2%
 (the test's bound).
 
-Not served: the ReplaySSM decode path and speculative decoding. Not tested: an
-engine built with `taps`.
+On an engine built with `taps`, name the site as
+`"backbone.layers.*.mixer.kernel"`. Layers 0 and 7 then equal the eager engine
+exactly.
+
+Not served: the ReplaySSM decode path and speculative decoding.
 
 ## Expert kernel sites
 
@@ -627,6 +635,16 @@ equal the one-rank engine to within 5% of the largest entry (the test's bound).
 
 `expert_activation` also takes `width=` to select intermediate units, on one
 rank and across ranks: `kernel.expert_activation(tokens=-1, width=[3, 700])`.
+
+On an engine built with `taps`, name the site as
+`"model.layers.*.mlp.experts.kernel"`. vLLM records the MoE layer into the CUDA
+graph whole, so a replayed step would run no Python there. For a MoE module
+with a kernel tap, nnsight keeps the module's body in Python as a graph break
+of its own and copies its output into a buffer the next graph segment reads.
+Module locations inside that body (the gate, for example) are then served on
+every step when they are taps. Layer 1 equals the eager engine; at layer 7 the
+rows differ by a few percent, and one pair of 30 was routed to another expert,
+because a replayed graph rounds differently from eager execution upstream.
 
 Not served: other experts kernels (FlashInfer, batched Triton, quantized
 weights or activations) and LoRA.

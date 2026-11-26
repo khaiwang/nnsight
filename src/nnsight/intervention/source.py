@@ -665,7 +665,7 @@ class Controller:
             # module has been popped from the stack.
             frame = kernel.push(interleaver, path)
             try:
-                output = run_body(state, module, args, kwargs)
+                output = interleaver.body(path, state, module, args, kwargs)
             finally:
                 kernel.pop(frame)
             return handle(locations[2], output)

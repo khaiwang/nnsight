@@ -803,6 +803,12 @@ class Interleaver:
 
         install_controller(envoy)
 
+    def body(self, path: str, state: Any, module: Any, args: tuple, kwargs: dict) -> Any:
+        """Run the body of the module at ``path``. A runtime that replays recorded steps overrides this to keep a body in Python."""
+        from .source import run_body  # lazy: source imports this module
+
+        return run_body(state, module, args, kwargs)
+
     def handle(self, provider: str, value: Any) -> Any:
         """Route ``value`` to this provider's consumers; return it, edited if any
         intervention wrote to this location.

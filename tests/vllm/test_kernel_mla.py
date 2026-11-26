@@ -26,7 +26,7 @@ STEPS = 3
 ONE_RANK: dict = {}
 
 
-@pytest.fixture(scope="module", params=["one_rank", "tensor_parallel"])
+@pytest.fixture(scope="module", params=["one_rank", "tensor_parallel", "taps"])
 def engine(request):
     from nnsight.modeling.vllm import VLLM
 
@@ -36,6 +36,8 @@ def engine(request):
             pytest.skip("tensor parallelism needs two GPUs")
         # Two ranks, each holding half of the heads.
         kwargs = {"tensor_parallel_size": 2}
+    if request.param == "taps":
+        kwargs = {"taps": ["model.layers.*.self_attn.mla_attn.mla_attn.kernel"]}
     return VLLM(
         REPO,
         gpu_memory_utilization=0.6,
@@ -68,6 +70,8 @@ def _read(engine):
 
 
 def test_probabilities_match_hf_eager(engine, request):
+    if "taps" in request.node.name:
+        pytest.skip("reads the sampled tokens, which are not a tap on this engine")
     steps, tokens, other = _read(engine)
     ids = engine.tokenizer(LONG)["input_ids"]
     count = len(ids)

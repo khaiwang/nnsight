@@ -95,6 +95,10 @@ class VLLMInterleaver(Interleaver):
         # ``{path}.output`` just after (`Controller.__call__`), which is where the
         # callables around a kernel tap's body are recorded.
         paths = [tap[: -len(kernel.SUFFIX)] for tap in self.taps if tap.endswith(kernel.SUFFIX)]
+        #: Modules with a kernel tap whose kernel vLLM records into the graph: their body is kept in Python.
+        self._bodies: set[str] = set()
+        #: Depth of such bodies running now. A tap reached inside one is served on the spot.
+        self._live = 0
         self._before = {f"{path}.skip": path for path in paths}
         self._after = frozenset(f"{path}.output" for path in paths)
         #: Frames of modules marked as running by a replayed step.
@@ -112,6 +116,11 @@ class VLLMInterleaver(Interleaver):
         load error rather than a request that parks forever.
         """
         super().instrument(envoy)
+        if f"{envoy.path}{kernel.SUFFIX}" in self.taps:
+            from .experts import recorded_into_graph
+
+            if recorded_into_graph(envoy._module):
+                self._bodies.add(envoy.path)
         prefix = f"{envoy.path}.source."
         ops = {tap[len(prefix):].rpartition(".")[0] for tap in self.taps if tap.startswith(prefix)}
         if not ops:
@@ -123,6 +132,36 @@ class VLLMInterleaver(Interleaver):
                 f"Tap on {envoy.path}.source: its forward has no operation "
                 f"{missing[0]!r}. Its operations are {list(source.names)}."
             )
+
+    def body(self, path: str, state: Any, module: Any, args: tuple, kwargs: dict) -> Any:
+        """Run a module's body; while vLLM records a graph, keep the body of a kernel-tapped module in Python.
+
+        vLLM's attention and state-space layers break the graph around their
+        kernel themselves, so a replayed step runs that kernel in Python and its
+        sites can be served. A layer vLLM records whole (the fused MoE) runs no
+        Python on replay. For such a module the body is recorded as a break of
+        its own, and its output is copied into a buffer the following graph
+        segment reads, as vLLM's own breaks write into a caller's buffer.
+        """
+        capture = _capture()
+        if path not in self._bodies or capture is None:
+            return super().body(path, state, module, args, kwargs)
+        live_args, live_kwargs = _weak(args), _weak(kwargs)
+        buffer: list[torch.Tensor] = []
+
+        def step() -> None:
+            self._live += 1
+            try:
+                output = super(VLLMInterleaver, self).body(path, state, module, live_args, live_kwargs)
+            finally:
+                self._live -= 1
+            if buffer:
+                buffer[0].copy_(output)
+            else:
+                buffer.append(output.clone())
+
+        capture.add_eager(step)
+        return buffer[0]
 
     def _enter(self, path: str) -> None:
         """Mark the module at ``path`` as running, on a replayed step."""
@@ -143,6 +182,12 @@ class VLLMInterleaver(Interleaver):
             self.counts[output] = self.counts.get(output, 0) + 1
 
     def handle(self, provider: str, value: Any) -> Any:
+        if self._live:
+            # Inside a body kept in Python, this code runs on every step: nothing is recorded, and a tap is
+            # served here, on the rows the step filled.
+            if provider in self.taps and self.interleaving:
+                self.replay(provider, value, super().handle)
+            return value
         path = self._before.get(provider)
         if path is not None or provider in self._after:
             capture = _capture()
@@ -168,7 +213,7 @@ class VLLMInterleaver(Interleaver):
             return value
         return super().handle(provider, value)
 
-    def replay(self, location: str, live: Any) -> None:
+    def replay(self, location: str, live: Any, handle: Any = None) -> None:
         """Serve ``location`` from a replayed graph: `handle`, then land any edit in place.
 
         A graph is recorded for a batch size, so its tensors carry that many rows
@@ -181,4 +226,4 @@ class VLLMInterleaver(Interleaver):
             return
         total = self.batcher.total
         live = apply(live, lambda t: t[:total] if t.dim() and t.shape[0] > total else t, torch.Tensor)
-        _copy_into(live, self.handle(location, live))
+        _copy_into(live, (handle or self.handle)(location, live))

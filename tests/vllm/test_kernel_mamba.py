@@ -22,7 +22,7 @@ HEADS = [20, 3, -1]
 ONE_RANK: dict = {}
 
 
-@pytest.fixture(scope="module", params=["one_rank", "tensor_parallel"])
+@pytest.fixture(scope="module", params=["one_rank", "tensor_parallel", "taps"])
 def engine(request):
     from nnsight.modeling.vllm import VLLM
 
@@ -31,6 +31,8 @@ def engine(request):
         if torch.cuda.device_count() < 2:
             pytest.skip("tensor parallelism needs two GPUs")
         kwargs = {"tensor_parallel_size": 2}
+    if request.param == "taps":
+        kwargs = {"taps": ["backbone.layers.*.mixer.kernel"]}
     return VLLM(REPO, gpu_memory_utilization=0.2, dispatch=True, hf_overrides={"architectures": ["Mamba2ForCausalLM"]}, **kwargs)
 
 

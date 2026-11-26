@@ -94,6 +94,8 @@ def _install() -> None:
 
 def serve(fn: Callable, args: tuple, kwargs: dict) -> tuple[Any, Sites]:
     """Run the layer's routed experts with ``TritonExperts.apply`` recording, and hand back a `Routed` reader."""
+    from vllm.forward_context import get_forward_context
+
     from .fragments import _tp_world_size
 
     _install()
@@ -116,7 +118,10 @@ def serve(fn: Callable, args: tuple, kwargs: dict) -> tuple[Any, Sites]:
     pairs = index.numel()
     if len(inputs) != 2 or inputs[1].shape[0] != pairs or inputs[1].shape[1] != bound["w2"].shape[2]:
         return output, Unavailable(f"{NAME} ran {len(inputs)} fused multiplies with inputs {[tuple(v.shape) for v in inputs]}; expected two, the second over {pairs} activation rows")
-    return output, Routed(call["hidden"], inputs[1], index, bound["w2"], experts.w2_bias, local, bound["global_num_experts"], partial)
+    # A replayed graph carries the rows of the batch size it was recorded for; the step fills the first of them.
+    metadata = get_forward_context().attn_metadata
+    actual = next(iter(metadata.values())).num_actual_tokens if isinstance(metadata, dict) and metadata else index.shape[0]
+    return output, Routed(call["hidden"], inputs[1], index, bound["w2"], experts.w2_bias, local, bound["global_num_experts"], partial, actual)
 
 
 class Routed(Sites):
@@ -136,11 +141,14 @@ class Routed(Sites):
         local: torch.Tensor | None,
         num_experts: int,
         partial: bool,
+        actual: int,
     ) -> None:
         self.hidden, self.activation, self.index, self.w2, self.bias = hidden, activation, index, w2, bias
         #: Under expert parallelism, each expert's row in this rank's weights, or -1 for an expert on another rank.
         self.expert_map = local
         self.num_experts = num_experts
+        #: Token rows the step filled; a replayed graph's buffers can hold more.
+        self.actual = actual
         #: Tensor parallelism without expert parallelism: this rank holds one block of every expert's intermediate width.
         self.partial = partial
         self.layout = {"tp": {"width": SPLIT}} if partial else {} if local is None else {"tp": {"slot": ROUTED, "expert": ROUTED}}
@@ -152,7 +160,7 @@ class Routed(Sites):
 
     def _site(self, site: str, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
         tokens, top_k = self.index.shape
-        start, size = (0, tokens) if self.batch is None else (self.batch.start, self.batch.size)
+        start, size = (0, self.actual) if self.batch is None else (self.batch.start, self.batch.size)
         if start + size > tokens:
             raise ValueError(f"kernel sites: the worker's rows [{start}, {start + size}) are outside the {tokens} token rows of this call")
         rows = slice(start, start + size)
@@ -211,6 +219,15 @@ class _Request(Experts):
             if call.bias is not None:
                 output[mask] += call.bias[row]
         return output
+
+
+def recorded_into_graph(module: torch.nn.Module) -> bool:
+    """Whether ``module`` is a layer whose experts kernel vLLM records into a CUDA graph without a break of its own."""
+    try:
+        from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+    except ImportError:
+        return False
+    return isinstance(module, MoERunner)
 
 
 def routed_experts(context: None) -> Located:

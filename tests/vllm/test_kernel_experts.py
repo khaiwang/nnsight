@@ -24,7 +24,7 @@ SHORT = "The capital of Japan is"
 ONE_RANK: dict = {}
 
 
-@pytest.fixture(scope="module", params=["one_rank", "expert_parallel", "tensor_parallel"])
+@pytest.fixture(scope="module", params=["one_rank", "expert_parallel", "tensor_parallel", "taps"])
 def engine(request):
     from nnsight.modeling.vllm import VLLM
 
@@ -40,6 +40,10 @@ def engine(request):
             pytest.skip("tensor parallelism needs two GPUs")
         # Two ranks, each holding half of every expert's intermediate width.
         kwargs = {"tensor_parallel_size": 2}
+    if request.param == "taps":
+        # CUDA graphs, broken at the MoE layer's kernel sites and at the module locations the tests read.
+        mlp = "model.layers.3.mlp"
+        kwargs = {"taps": [f"{mlp}.experts.kernel", f"{mlp}.experts.input", f"{mlp}.experts.output", f"{mlp}.gate.output"]}
     return VLLM(
         REPO,
         gpu_memory_utilization=0.6,
@@ -52,7 +56,7 @@ def engine(request):
 
 
 def test_rows_match_the_layers_weights(engine, request):
-    if "one_rank" not in request.node.name:
+    if "parallel" in request.node.name:
         pytest.skip("a rank holds a share of the experts' weights, so the reference is computed on one rank")
     mlp = engine.model.layers[3].mlp
     experts = mlp.experts
@@ -133,6 +137,8 @@ def test_selection(engine):
 
 def test_two_ranks_match_one_rank(engine, request):
     """The ranks' pieces assemble into the one-rank rows; a dropped pair or a missing half of the width would read 0."""
+    if "taps" in request.node.name:
+        pytest.skip("a replayed graph rounds differently from eager execution, which can route a token to another expert")
     mlp = engine.model.layers[3].mlp
     kernel = mlp.experts.kernel
     with engine.trace(temperature=0.0, max_tokens=2) as tracer:
