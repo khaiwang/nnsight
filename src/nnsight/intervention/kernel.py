@@ -344,6 +344,9 @@ def shim(entry: Entry) -> Callable:
         if not _serves(frame):
             return fn(*args, **kwargs)
         output, sites = entry.serve(fn, args, kwargs)
+        fragments = frame.interleaver.fragments
+        if sites.layout and fragments is not None and fragments.enabled:
+            sites.ranks = fragments.ranks(frame.path)
         frame.interleaver.handle(f"{frame.path}{SUFFIX}", sites)
         return output
 

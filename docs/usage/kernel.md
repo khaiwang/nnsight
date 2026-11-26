@@ -500,7 +500,7 @@ declarations, so a site method is written once, for one rank.
 | `axes` | Site name to the axes a caller can index, in the order they appear in the value. An unknown keyword raises `ValueError` before the site method runs. |
 | `lead` | Number of dimensions before the first named axis: 1 for a value with a batch dimension, 0 for vLLM's flat rows. |
 | `layout` | Parallel mode (`"tp"`) to axis name to layout. An axis not listed is `WHOLE`. |
-| `ranks` | Set on a reader whose call ran split across ranks: `Ranks(mode, world, rank, reduce)`, where `reduce` sums a tensor over the ranks. `None` otherwise. |
+| `ranks` | The rank group of a call inside a split module: `Ranks(mode, world, rank, reduce, widths)`, where `reduce` sums a tensor over the ranks. `None` otherwise. A reader does not compute it. The kernel shim sets it from the runtime's `Fragments.ranks(path)`, which answers from the model's own sharding plan. |
 | `local(axis)` | The length of a `SPLIT` axis on this rank. |
 
 The layouts:
@@ -536,12 +536,19 @@ What a site method must do:
   control flow that differs between ranks, the same condition as an ad-hoc call
   of a sharded module ([tensor-parallel](../models/tensor-parallel.md)).
 
+Where the rank group comes from, per runtime:
+
+| Runtime | `Fragments.ranks(path)` returns a group when | Check |
+|---|---|---|
+| transformers | the model's tensor-parallel plan column-shards a projection inside the module at `path` (the query projection of an attention module) | the attention reader raises `ValueError` unless its local heads times the head size times the rank count equals the whole width of one of those projections |
+| vLLM | the engine has more than one tensor-parallel rank; vLLM shards every attention layer's query projection by head | none |
+
 What each served reader declares:
 
 | Reader | Sites and axes | `lead` | Layout under tensor parallelism |
 |---|---|---|---|
 | vLLM paged FlashAttention (`modeling/vllm/kernel.py`) | `lse` [query, heads]; `scores`, `probs` [query, heads, key] | 0 | heads `SPLIT`; query and key `WHOLE` |
-| `scaled_dot_product_attention`, eager and FlashAttention 2 in transformers (`intervention/attention.py`) | `lse` [heads, query]; `scores`, `probs` [heads, query, key] | 1 | not declared: `heads=` indexes this rank's heads |
+| `scaled_dot_product_attention`, eager and FlashAttention 2 in transformers (`intervention/attention.py`) | `lse` [heads, query]; `scores`, `probs` [heads, query, key] | 1 | heads `SPLIT`; query and key `WHOLE` |
 | Recurrent scans in transformers (`modeling/kernels/recurrent.py`) | `chunk_states` [chunks, heads]; `states` [tokens, heads] | 1 | all `WHOLE` |
 | Experts forwards in transformers (`modeling/kernels/experts.py`) | per-pair rows [tokens, slot], with `expert=` selecting in place of `slot` | none | not served |
 
@@ -553,14 +560,13 @@ The layouts still to add, and the kernels that need them, are listed in the
 - **Reads only:** A site cannot be assigned to. To modify attention scores, add
   a bias to the mask the module passes to the kernel, or edit `q` and `k` before
   the call ([access-and-modify](access-and-modify.md)).
-- **Tensor parallelism:** On vLLM, attention sites return every head
+- **Tensor parallelism:** Attention sites return every head on transformers
+  and on vLLM: each rank's kernel call holds `heads / tp` heads and the ranks'
+  blocks are assembled
   ([the reader contract](#the-reader-contract-axes-and-their-layout-across-ranks)).
-  On a transformers model, each rank holds `heads / tp` query heads, and
-  `heads=` indexes the local rank's heads; rank 0 returns its own share without
-  a gather
-  ([tensor-parallel](../models/tensor-parallel.md#what-is-not-supported)).
-  Recurrent sites are full on every rank because transformers gathers the
-  projections before calling the kernel.
+  A site read is a collective, so it must not sit under control flow that
+  differs between ranks. Recurrent sites are full on every rank because
+  transformers gathers the projections before calling the kernel.
 - **Unsupported recurrent and attention kernels:** `mamba_ssm`'s fused
   `mamba_chunk_scan_combined`, `selective_scan_fn`, and `selective_state_update`
   are not registered, and neither are `fla`'s `chunk_kda` and

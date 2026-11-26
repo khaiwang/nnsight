@@ -98,6 +98,15 @@ class VLLMFragments(Fragments):
                 self.rules[f"{envoy.path}.{side}"] = (module, side)
                 self.enabled = True
 
+    def ranks(self, path: str) -> Any:
+        """The tensor-parallel group: vLLM shards every attention layer's query projection by head."""
+        from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+
+        from ...intervention.sites import Ranks
+
+        return Ranks("tp", _tp_world_size(), get_tensor_model_parallel_rank(), tensor_model_parallel_all_reduce)
+
     def fragmented(self, location: str) -> bool:
         return location in self.rules
 

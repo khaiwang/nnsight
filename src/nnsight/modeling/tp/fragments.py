@@ -642,6 +642,33 @@ class TPFragments(Fragments):
         """
         return self.tp_styles.get(path, (None, None))
 
+    def ranks(self, path: str) -> Any:
+        """The tp group, when the plan column-shards a projection inside the module at ``path``.
+
+        A column-sharded query projection is what leaves each rank's attention
+        kernel a block of the heads. ``widths`` carries the whole output sizes of
+        those projections, which the attention reader checks its heads against.
+        """
+        from torch.distributed.tensor import Partial, Shard
+
+        from ...intervention.sites import Ranks
+
+        found = [
+            (mesh, width)
+            for location, (mesh, placement, width) in self.tp_rules.items()
+            if location.startswith(f"{path}.") and location.endswith(".output") and isinstance(placement, Shard)
+        ]
+        if not found:
+            return None
+        mesh = found[0][0]
+        return Ranks(
+            "tp",
+            mesh.size(),
+            mesh.get_local_rank(),
+            lambda tensor: _whole_tensor(tensor, mesh, Partial()),
+            frozenset(width for _, width in found),
+        )
+
     def fragmented(self, location: str) -> bool:
         """Whether this location's value is one rank's piece.
 

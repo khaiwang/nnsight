@@ -141,6 +141,8 @@ class Attention(Sites):
     names = ("lse", "scores", "probs")
     axes = {"lse": ("heads", "query"), "scores": ("heads", "query", "key"), "probs": ("heads", "query", "key")}
     lead = 1
+    #: A column-sharded query projection leaves each rank one block of the heads.
+    layout = {"tp": {"heads": sites.SPLIT}}
 
     def __init__(self, bound: dict[str, Any], capture: _Capture) -> None:
         self.q: torch.Tensor = bound["query"].detach()
@@ -191,6 +193,15 @@ class Attention(Sites):
         if self.dropout:
             return f"{formula}; dropout_p={self.dropout} is applied after these probabilities"
         return formula
+
+    def local(self, axis: str) -> int:
+        heads, dim = self.q.shape[1], self.q.shape[-1]
+        if heads * dim * self.ranks.world not in self.ranks.widths:
+            raise ValueError(
+                f"kernel sites: this rank's attention call has {heads} heads of size {dim} on {self.ranks.world} ranks, which matches no "
+                f"column-sharded projection in the module (whole widths {sorted(self.ranks.widths)}), so the heads cannot be assembled"
+            )
+        return heads
 
     def _axes(self, spec: dict[str, Any]) -> tuple:
         """Resolve query heads, corresponding KV heads, query row indices, and key column indices from ``spec``."""

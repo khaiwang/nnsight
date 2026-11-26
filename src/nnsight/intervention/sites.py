@@ -41,8 +41,10 @@ are always logical: ``heads=9`` is the model's head 9 on one device and on
 eight.
 
 On a model split across ranks, a reader also declares how each axis is laid out
-(``layout``, per parallel mode) and sets ``ranks`` on the readers of a call that
-ran in that mode:
+(``layout``, per parallel mode). The runtime's
+[`Fragments`][nnsight.intervention.fragments.Fragments] names the rank group
+(`Fragments.ranks`), which the kernel shim sets as ``ranks`` on the reader of a
+call inside a module that is split:
 
 * `WHOLE` (the default): every rank holds the full axis with the same values.
 * `SPLIT`: each rank holds one contiguous block of equal length, in rank order.
@@ -116,6 +118,8 @@ class Ranks(NamedTuple):
     rank: int
     #: Sums a tensor of one shape over the group's ranks and returns the sum on each.
     reduce: Callable[[torch.Tensor], torch.Tensor]
+    #: Whole last-dim sizes of the split projections inside the module, for a reader that checks its split against them. Empty when the runtime records none.
+    widths: frozenset[int] = frozenset()
 
 
 class Batch(NamedTuple):

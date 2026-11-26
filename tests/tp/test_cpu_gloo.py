@@ -202,6 +202,8 @@ def test_the_ranks_agree(runs) -> None:
         "batched_first",
         "batched_edited_logits",
         "generated_steps",
+        "kernel_probs",         # attention heads, a block per rank, assembled
+        "kernel_head_scores",   # ... and selected by the model's head index
     ],
 )
 def test_rank0_matches_the_single_process_run(runs, name) -> None:

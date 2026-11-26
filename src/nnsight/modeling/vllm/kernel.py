@@ -44,7 +44,7 @@ import torch
 from ...intervention import sites
 from ...intervention.attention import _exact_fp32
 from ...intervention.kernel import Attr, Located, Spec, register_catalog, unshimmed
-from ...intervention.sites import SPLIT, Batch, Provenance, Ranks, Sites, Unavailable
+from ...intervention.sites import SPLIT, Batch, Provenance, Sites, Unavailable
 from ...intervention.source import arguments
 
 NAME = "flash_attn_varlen_func"
@@ -109,12 +109,6 @@ class Paged(Sites):
         #: ``[heads, total query rows]`` fp32, as the kernel returns it.
         self.exported: torch.Tensor = lse.detach()
         self.batch: Batch | None = None
-        from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
-        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
-
-        world = get_tensor_model_parallel_world_size()
-        if world > 1:
-            self.ranks = Ranks("tp", world, get_tensor_model_parallel_rank(), tensor_model_parallel_all_reduce)
 
     def local(self, axis: str) -> int:
         return self.q.shape[1]
