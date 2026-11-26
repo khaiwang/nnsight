@@ -265,9 +265,9 @@ kernel, the location never fires and the trace ends with `OutOfOrderError:
   CodeGen, GPT-J, DeBERTa).
 - An MoE layer running under `experts_implementation="eager"` (or `deepgemm`,
   `sonicmoe`, FP8, or `kernels`).
-- A vLLM model's state-space and MoE layers, and its attention on any backend
-  other than FlashAttention. vLLM's FlashAttention sites, including on an engine
-  built with `taps`, are described in
+- A vLLM model's Mamba and MoE layers, and its attention on any backend other
+  than FlashAttention. vLLM's FlashAttention sites, including on an engine
+  built with `taps`, and its gated delta rule sites are described in
   [models/vllm.md](../models/vllm.md#attention-kernel-sites).
 
 ## Recurrent states of a chunked kernel
@@ -551,6 +551,7 @@ What each served reader declares:
 | vLLM paged FlashAttention (`modeling/vllm/kernel.py`) | `lse` [query, heads]; `scores`, `probs` [query, heads, key] | 0 | heads `SPLIT`; query and key `WHOLE` |
 | `scaled_dot_product_attention`, eager and FlashAttention 2 in transformers (`intervention/attention.py`) | `lse` [heads, query]; `scores`, `probs` [heads, query, key] | 1 | heads `SPLIT`; query and key `WHOLE` |
 | Recurrent scans in transformers (`modeling/kernels/recurrent.py`) | `chunk_states` [chunks, heads]; `states` [tokens, heads] | 1 | all `WHOLE` |
+| vLLM gated delta rule layer (`modeling/vllm/recurrent.py`) | `chunk_states` [chunks, heads]; `states` [tokens, heads] | 0 | not served |
 | Experts forwards in transformers (`modeling/kernels/experts.py`) | per-pair rows [tokens, slot], with `expert=` selecting in place of `slot` | none | not served |
 
 The layouts still to add, and the kernels that need them, are listed in the

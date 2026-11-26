@@ -208,3 +208,74 @@ def test_taps_serve_each_invoke_its_own_request(vllm_gpt2_kernel_taps, vllm_gpt2
     for expected, value in zip(read(vllm_gpt2), read(vllm_gpt2_kernel_taps)):
         assert value.shape == expected.shape
         assert torch.allclose(value, expected, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Recurrent sites on gated delta rule layers (Qwen3.5)
+# ---------------------------------------------------------------------------
+
+GDN_REPO = "Qwen/Qwen3.5-0.8B"
+# 145 tokens: three chunks of 64, so the states cross two chunk boundaries.
+GDN_PROMPT = "The Eiffel Tower is located in the city of Paris and " * 12
+GDN_TOKENS = [0, 5, 63, 64, 100, 144]
+
+
+@pytest.fixture(scope="module")
+def vllm_gdn():
+    from nnsight.modeling.vllm import VLLM
+
+    return VLLM(GDN_REPO, gpu_memory_utilization=0.45, dispatch=True)
+
+
+def test_recurrent_states_match_hf(vllm_gdn):
+    """Chunk-boundary and per-token states of layer 0 against the transformers sites, in the same ``[heads, K, V]`` layout.
+
+    vLLM's Triton kernel runs in bf16 and transformers' reference in fp32, so they agree to bf16 rounding.
+    """
+    from nnsight import TransformersModel
+
+    attn = vllm_gdn.language_model.model.layers[0].linear_attn
+    with vllm_gdn.trace(GDN_PROMPT, temperature=0.0, max_tokens=1):
+        chunks = attn.kernel.chunk_states().clone().save()
+        states = attn.kernel.states(tokens=GDN_TOKENS).clone().save()
+        one = attn.kernel.states(tokens=100, heads=3).clone().save()
+
+    reference = TransformersModel(GDN_REPO, task="text-generation", device="cuda", dtype=torch.bfloat16, dispatch=True)
+    with reference.trace(GDN_PROMPT):
+        hf = reference.model.layers[0].linear_attn
+        expected_chunks = hf.kernel.chunk_states().save()
+        expected_states = hf.kernel.states(tokens=GDN_TOKENS).save()
+
+    def relative(value, expected):
+        expected = expected.float().cpu()
+        return ((value.float().cpu() - expected).abs().max() / expected.abs().max()).item()
+
+    assert chunks.shape == expected_chunks[0].shape == (4, 16, 128, 128)
+    assert (chunks[0] == 0).all()
+    assert relative(chunks[1:], expected_chunks[0][1:]) < 2e-2
+    assert states.shape == expected_states[0].shape
+    assert relative(states, expected_states[0]) < 2e-2
+    assert torch.equal(one, states[4, 3])
+
+
+def test_recurrent_decode_steps_continue_each_request(vllm_gdn):
+    attn = vllm_gdn.language_model.model.layers[0].linear_attn
+    with vllm_gdn.trace(temperature=0.0, max_tokens=3) as tracer:
+        with tracer.invoke(GDN_PROMPT):
+            long = list().save()
+            for _ in tracer.iter[:3]:
+                long.append((attn.kernel.chunk_states().clone(), attn.kernel.states().clone()))
+        with tracer.invoke("The capital of Japan is"):
+            short = list().save()
+            for _ in tracer.iter[:3]:
+                short.append((attn.kernel.chunk_states().clone(), attn.kernel.states().clone()))
+    # A prefill serves the state entering each chunk and the final one; a decode step the state before and after its token.
+    assert [chunks.shape[0] for chunks, _ in long] == [4, 2, 2]
+    assert [states.shape[0] for _, states in long] == [145, 1, 1]
+    assert short[0][0].shape[0] == 2 and short[0][1].shape[0] < 64
+    assert not torch.equal(long[0][0][-1], short[0][0][-1])
+    for steps in (long, short):
+        assert torch.equal(steps[0][1][-1], steps[0][0][-1])
+        for previous, (chunks, states) in zip(steps, steps[1:]):
+            assert torch.equal(chunks[0], previous[0][-1])
+            assert torch.equal(states[0], chunks[1])

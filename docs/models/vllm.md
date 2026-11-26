@@ -455,6 +455,47 @@ callables around the layer. A kernel site that is not a tap raises the same
 
 The sites are not served on other attention backends (Triton, FlashInfer, MLA).
 
+## Recurrent kernel sites
+
+On Qwen3-Next and Qwen3.5 models, a gated delta rule layer
+(`layers[i].linear_attn`) carries the recurrent
+[kernel sites](../usage/kernel.md#recurrent-states-of-a-chunked-kernel)
+`chunk_states` and `states`:
+
+```python
+attn = model.language_model.model.layers[0].linear_attn      # Qwen3.5-0.8B
+with model.trace(prompt, max_tokens=3, temperature=0.0) as tracer:
+    steps = list().save()
+    for _ in tracer.iter[:3]:
+        steps.append(attn.kernel.chunk_states().clone())
+# a 145-token prompt: [tuple(s.shape) for s in steps] == [(4, 16, 128, 128), (2, 16, 128, 128), (2, 16, 128, 128)]
+```
+
+| Site | Shape | Value |
+|------|-------|-------|
+| `chunk_states` | `[chunks, heads, K, V]` | On a prefill step: the state entering each 64-token chunk of the request's tokens in this step, then its final state. On a decode step: the state before the token and the state after it. |
+| `states` | `[tokens, heads, K, V]` | The state after each token of the step. A token that ends a chunk is the kernel's own state; one inside a chunk is advanced from the chunk's entering state in fp32. |
+
+There is no batch axis, and an invoke reads only its own request. `chunks=`,
+`tokens=` and `heads=` select as on a transformers model, and a selection is
+applied before anything is computed.
+
+vLLM's kernels and its state cache hold a state as `[heads, V, K]`. The sites
+serve `[heads, K, V]`, the layout of the transformers sites, so the same code
+reads both. On Qwen3.5-0.8B layer 0, the chunk states and the per-token states
+of a 145-token prompt equal the transformers sites to 0.8% of the largest entry;
+vLLM's kernel runs in bf16 and transformers' reference in fp32.
+
+Each request's state lives in a slot of the layer's state cache, and a decode
+step advances the slot in place. The state a decode step serves as entering is
+therefore the state the previous step served as final, bit for bit.
+
+Served on the Triton/FLA prefill kernel, which vLLM selects on GPUs before
+Hopper, and on the one-token decode kernels. Not served: a prefill on the
+FlashInfer kernel (vLLM's choice on Hopper), which returns no chunk states;
+speculative decoding; tensor parallelism; and the Kimi and OLMo gated delta
+rule layers.
+
 ## CUDA graphs with taps
 
 vLLM's decode throughput comes largely from CUDA-graph replay, which `enforce_eager=True` gives up because a replayed graph runs no Python and so no hooks. `taps` keeps the graphs: the locations you name are recorded *into* the graph as breaks (vLLM's `VLLM_USE_BREAKABLE_CUDAGRAPH`), and at each break the interleaver's normal handoff runs on every replay. Everything else is unchanged — the same trace syntax, per-request scoping, `tracer.iter`, `model.logits` / `model.samples`.

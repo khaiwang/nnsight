@@ -121,7 +121,8 @@ runtime's code or nnsight's docs and not run.
 | MLA backends (vLLM) | not surveyed | not surveyed | not surveyed | not started |
 | `scaled_dot_product_attention`, eager, FlashAttention 2 (transformers) | heads, query, key after a batch dimension | heads `SPLIT`; query, key `WHOLE` | not applicable | declared; measured on the CPU suite (`tests/tp/test_cpu_gloo.py`, tiny random Llama at 2 ranks). The rank group is set only when the plan column-shards a projection inside the attention module |
 | gated delta rule, Kimi delta attention, Mamba (transformers) | chunks or tokens, heads after a batch dimension | all `WHOLE`: transformers gathers the projections before the kernel (from `docs/usage/kernel.md`) | not applicable | declared; needs no collective |
-| `gdn_attn`, `linear_attn`, `mamba1_attn`, `mamba2_attn` (vLLM) | not surveyed | not surveyed | not surveyed | not started; vLLM keeps the state in its own state cache |
+| gated delta rule layer of Qwen3-Next and Qwen3.5, `gdn_attn` (vLLM) | chunks or tokens, heads | not surveyed; refused today | not applicable | declared; measured on Qwen3.5-0.8B on one A100 against the transformers sites. Triton/FLA prefill kernel and the one-token decode kernels. The FlashInfer prefill kernel (Hopper) exports checkpoints at a set interval, not read yet |
+| Kimi and OLMo gated delta rule layers, `linear_attn`, `mamba1_attn`, `mamba2_attn` (vLLM) | not surveyed | not surveyed | not surveyed | not started; vLLM keeps each request's state in a slot of the layer's state cache |
 | `grouped_mm` and `batched_mm` experts forwards (transformers) | tokens, slot | intermediate dimension split and the down projection a partial sum (from the docstring in `modeling/kernels/experts.py`) | each rank holds the (token, expert) pairs routed to its experts, other pairs as sentinels | not served; needs two layouts the contract does not have yet |
 | fused MoE (vLLM) | tokens, slot | not surveyed | not surveyed | not started; the experts run inside one custom op |
 
@@ -139,7 +140,8 @@ Not surveyed. Served today: gated delta rule, Kimi delta attention, Mamba2 and
 Mamba1 through transformers' hub-kernel wrappers (Python reference, with or
 without the `kernels` package installed), and the `fla` gated delta rule
 kernels. vLLM registers `gdn_attn`, `linear_attn`, `short_conv_attn`,
-`mamba1_attn` and `mamba2_attn` backends; none is shimmed.
+`mamba1_attn` and `mamba2_attn` backends; the Qwen gated delta rule layer of
+`gdn_attn` is served, the others are not.
 
 ## Mixture of experts
 
