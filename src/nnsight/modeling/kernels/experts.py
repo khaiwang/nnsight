@@ -57,7 +57,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 from ...intervention import sites
 from ...intervention.sites import Batch, Provenance, Sites, Unavailable
 from ...intervention.source import arguments, record
-from ..tp.fragments import _is_tp_wrapped
+from ..tp.fragments import _TP_WRAPPED
 
 #: Local variable binding names in `grouped_mm_experts_forward` and
 #: `batched_mm_experts_forward` for the per-pair input, the gated or ungated
@@ -146,13 +146,14 @@ def _parallel(module: torch.nn.Module) -> bool:
     Under tensor or expert parallelism, each rank computes only a shard of the
     intermediate dimension and a partial down projection, or fills unowned pairs
     with sentinel indices. Expert parallelism sets ``_is_expert_parallel`` on the
-    module. Tensor parallelism installs a wrapper on ``module.forward`` (which
-    nnsight rebuilds around the controller; see modeling/tp/fragments.py).
+    module. Tensor parallelism installs a wrapper on ``module.forward``, which
+    nnsight rebuilds around the controller and marks with ``_TP_WRAPPED`` (see
+    modeling/tp/fragments.py).
     Inspecting the parameters for ``DTensor`` does not detect tensor parallelism
     during the call because transformers swaps them for this rank's local
     tensors while the forward runs.
     """
-    return module._is_expert_parallel or _is_tp_wrapped(module)
+    return module._is_expert_parallel or bool(module.__dict__.get(_TP_WRAPPED))
 
 
 def _serve(fn: Callable, args: tuple, kwargs: dict, layout: dict[str, str], sorted_rows: bool) -> tuple[Any, Sites]:
