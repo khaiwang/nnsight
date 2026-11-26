@@ -147,6 +147,16 @@ recomputed every step:
   leaves that rank making per-request calls while the others made one, and the
   ranks' collectives stop matching; a per-request call that raises on one rank
   only does the same without coalescing.
+- `VLLM.attach(name, module, rows)` serializes a module once and calls
+  `nnsight_attach` on every worker (`collective_rpc`, as `nnsight_register`
+  does for an edit). The runner moves the module to its device, sets it on its
+  model's tree, adds the new `Module:<path>` ids to
+  `nnsight_persistent_objects` (the table is otherwise built once, at load), and
+  registers the module with the coalescer when `rows` is given. The client sets
+  the same attribute on its own tree after the workers have, so a block's
+  `Module:model.<name>` id resolves. Every rank runs the handler, so every rank
+  holds the module and shares the same calls of it; an attached module is
+  replicated and runs no collective.
 - `unflatten(model)` re-points each scheduled worker to `[row, 1]` for the
   per-request logits/samples tensors.
 - `match(request_ids)` reconciles engine ids with worker ids — vLLM appends

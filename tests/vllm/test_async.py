@@ -116,6 +116,33 @@ class TestAsyncEngine:
 
         async_loop.run_until_complete(run())
 
+    def test_a_module_attached_on_the_loop_is_called_by_a_trace(
+        self, vllm_gpt2_async, async_loop, ET_prompt
+    ):
+        from probes import AggregateProbe
+
+        model = vllm_gpt2_async
+        width = model.transformer.ln_f.weight.shape[0]
+        probe = AggregateProbe(width, seed=7)
+
+        async def run():
+            # The plain form cannot await the workers on an async engine.
+            with pytest.raises(NotImplementedError, match="aattach"):
+                model.attach("span_reader", probe, rows="span")
+            await model.aattach("span_reader", probe, rows="span")
+            with model.trace(ET_prompt, temperature=0.0, max_tokens=1) as tracer:
+                hidden = model.transformer.h[2].output.clone().save()
+                score = model.span_reader(hidden).save()
+
+            last = None
+            async for output in tracer.backend:
+                last = output
+            hidden = last.saves["hidden"].float().cpu()
+            expected = probe(hidden, sizes=[len(hidden)])[0]
+            assert torch.allclose(last.saves["score"].float().cpu(), expected, atol=1e-3)
+
+        async_loop.run_until_complete(run())
+
     def test_only_last_output_is_finished(
         self, vllm_gpt2_async, async_loop, ET_prompt
     ):

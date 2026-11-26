@@ -85,6 +85,52 @@ def _warn_if_prefix_caching(model: "VLLM") -> None:
         )
 
 
+def collective(model: "VLLM", method: str, args: tuple) -> Any:
+    """Call ``method`` on every worker of ``model``'s engine, however it reaches them."""
+    engine = model.vllm_entrypoint
+    # The sync entrypoint keeps the engine one level down; the async one is
+    # already the engine.
+    core = getattr(engine, "llm_engine", engine)
+    return core.collective_rpc(method, args=args)
+
+
+def rpc(model: "VLLM", method: str, *args: Any) -> list:
+    """Reach every worker from an ordinary statement.
+
+    The async engine's ``collective_rpc`` is a coroutine instead, and there is
+    no safe way to finish one from here: driving it on a loop of our own
+    deadlocks against the loop the engine is already running on. So this
+    refuses rather than returning a coroutine nobody awaits, which would leave
+    the call unmade with nothing saying so.
+    """
+    result = collective(model, method, args)
+    if inspect.iscoroutine(result):
+        result.close()
+        raise NotImplementedError(
+            f"{method} has to reach the engine's workers, and on an async "
+            "engine (mode='async') that call is a coroutine, which can only "
+            "be awaited from inside the loop the engine already runs on. Use "
+            "the awaited forms there: `async with model.edit()`, "
+            "`await edit.aclear()`, `await model.aclear_edits()`, "
+            "`await model.aattach(...)`."
+        )
+    return result
+
+
+async def arpc(model: "VLLM", method: str, *args: Any) -> list:
+    """`rpc` from inside a running event loop, where awaiting is possible.
+
+    Which is the only place it is: the engine's machinery binds to whichever
+    loop first drives it, so a loop of our own on another thread never gets an
+    answer (``run_coroutine_threadsafe`` times out), and the engine exposes no
+    loop to target instead.
+    """
+    result = collective(model, method, args)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
 class Registration:
     """A handle on a block the engine is running for every request.
 
@@ -119,64 +165,21 @@ class Registration:
         self.name = name
         self.cleared = False
 
-    def _collective(self, method: str, args: tuple) -> Any:
-        """Call `method` on every worker, however this engine reaches them."""
-        engine = self.model.vllm_entrypoint
-        # The sync entrypoint keeps the engine one level down; the async one is
-        # already the engine.
-        core = getattr(engine, "llm_engine", engine)
-        return core.collective_rpc(method, args=args)
-
-    def _rpc(self, method: str, *args: Any) -> list:
-        """Reach every worker.
-
-        Synchronous, because registering and clearing are ordinary statements.
-        The async engine's ``collective_rpc`` is a coroutine instead, and there is
-        no safe way to finish one from here — driving it on a loop of our own
-        deadlocks against the loop the engine is already running on. So this
-        refuses rather than returning a coroutine nobody awaits — which would
-        leave the block uninstalled with nothing saying so.
-        """
-        result = self._collective(method, args)
-        if inspect.iscoroutine(result):
-            result.close()
-            raise NotImplementedError(
-                f"{method} has to reach the engine's workers, and on an async "
-                "engine (mode='async') that call is a coroutine, which can only "
-                "be awaited from inside the loop the engine already runs on. Use "
-                "the awaited forms there: `async with model.edit()`, "
-                "`await edit.aclear()`, `await model.aclear_edits()`."
-            )
-        return result
-
-    async def _arpc(self, method: str, *args: Any) -> list:
-        """`_rpc` from inside a running event loop, where awaiting is possible.
-
-        Which is the only place it is: the engine's machinery binds to whichever
-        loop first drives it, so a loop of our own on another thread never gets an
-        answer (``run_coroutine_threadsafe`` times out), and the engine exposes no
-        loop to target instead.
-        """
-        result = self._collective(method, args)
-        if inspect.isawaitable(result):
-            return await result
-        return result
-
     def install(self, payload: bytes) -> None:
         """Put the block on the engine. The seam a serve client replaces."""
-        self._rpc("nnsight_register", self.id, payload, self.name)
+        rpc(self.model, "nnsight_register", self.id, payload, self.name)
 
     async def ainstall(self, payload: bytes) -> None:
         """`install`, awaited."""
-        await self._arpc("nnsight_register", self.id, payload, self.name)
+        await arpc(self.model, "nnsight_register", self.id, payload, self.name)
 
     def uninstall(self) -> None:
         """Take the block off the engine. The other half of the seam."""
-        self._rpc("nnsight_clear_registered", self.id)
+        rpc(self.model, "nnsight_clear_registered", self.id)
 
     async def auninstall(self) -> None:
         """`uninstall`, awaited."""
-        await self._arpc("nnsight_clear_registered", self.id)
+        await arpc(self.model, "nnsight_clear_registered", self.id)
 
     def clear(self) -> None:
         """Stop running the block and drop anything it has not handed back.

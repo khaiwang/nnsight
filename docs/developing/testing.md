@@ -168,6 +168,7 @@ in `SamplingParams.extra_args`. TP tests use Qwen2.5-0.5B; single-rank tests use
 | `test_moe_batching.py` | deferred-reduce partials gather on read |
 | `test_taps.py` | tracing an engine replaying CUDA graphs, at declared taps |
 | `test_registration.py` | blocks installed on the engine, applying to every request |
+| `test_attach.py` | modules attached to the engine's model, token-wise and span probes shared between requests |
 | `test_chunked_prefill.py` / `test_preemption.py` | a traced prompt is prefilled whole; a preempted request comes back whole |
 | `test_lora.py` | interventions on a request carrying an adapter |
 | `test_requests.py` | client/worker cleanup, batch isolation, concurrency |

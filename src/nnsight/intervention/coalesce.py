@@ -20,9 +20,16 @@ linear map are; anything that mixes rows (a mean over tokens, attention) is not,
 and concatenating two requests' rows into it would let one request's values
 reach another's. The coalescer does not find this out by running anything. The
 runtime states which calls are token-wise when it builds the coalescer (the
-``tokenwise`` predicate), and a module can be added by name with
+``tokenwise`` predicate), and a module can be added with
 [`register`][nnsight.intervention.coalesce.Coalescer.register]; any other call
 runs on its caller's arguments alone.
+
+A module that reduces over each caller's own rows (attention pooling over a
+request's tokens, a pairwise distance between them) is not token-wise, but can
+still run once: registered with ``rows="span"`` it is given every caller's rows
+concatenated and ``sizes``, each caller's row count, and returns one item per
+caller. The module is responsible for computing item ``i`` from caller ``i``'s
+rows only.
 
 Workers take turns at a module call: one parked on a call lets the next worker
 run before it gets its result. A runtime whose workers have separate scopes and
@@ -53,7 +60,8 @@ class Outcome(NamedTuple):
 
 
 class Unsplittable(Exception):
-    """A result holds something that is not one row per input row."""
+    """A result holds something that is not one row per input row, or a span
+    module's result is not one item per caller."""
 
 
 def split(result: Any, sizes: list[int]) -> list:
@@ -96,6 +104,45 @@ def split(result: Any, sizes: list[int]) -> list:
             pieces.append(piece)
         return pieces
     raise Unsplittable()
+
+
+def each(result: Any, count: int) -> list:
+    """The ``count`` items a span module returned, one per caller.
+
+    Raises:
+        Unsplittable: ``result`` is not a tensor or a list ``count`` long.
+    """
+    if not isinstance(result, list) and not (isinstance(result, torch.Tensor) and result.ndim > 0):
+        raise Unsplittable(
+            f"a span module returns one item per caller, as a tensor or a list; got {type(result).__name__}"
+        )
+    if len(result) != count:
+        raise Unsplittable(
+            f"a span module returns one item per caller: {len(result)} items for {count} callers"
+        )
+    return [result[index] for index in range(count)]
+
+
+def span(call: Call) -> int:
+    """The row count of a call of a span module.
+
+    Raises:
+        TypeError: the call is not ``module(rows, ...)`` with ``rows`` its only
+            tensor, or passes ``sizes`` itself.
+    """
+    rest = [*call.args[1:], *call.kwargs.values()]
+    if (
+        not call.args
+        or not isinstance(call.args[0], torch.Tensor)
+        or call.args[0].ndim == 0
+        or any(isinstance(value, torch.Tensor) for value in rest)
+        or "sizes" in call.kwargs
+    ):
+        raise TypeError(
+            "a span module is called as module(rows, ...): its rows as the first "
+            "positional argument, no other tensor, and no sizes (the coalescer passes them)"
+        )
+    return call.args[0].shape[0]
 
 
 class Group:
@@ -153,17 +200,38 @@ class Coalescer:
 
     def __init__(self, tokenwise: Callable[[Call], bool] = lambda call: False) -> None:
         self.tokenwise = tokenwise
-        self.registered: weakref.WeakSet = weakref.WeakSet()
+        # module -> "token" or "span", as `register` was told.
+        self.registered: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
-    def register(self, module: torch.nn.Module) -> None:
-        """State that every call of ``module`` is token-wise. This is taken as
-        given: registering a module that mixes rows lets one worker's values
-        reach another's."""
-        self.registered.add(module)
+    def register(self, module: torch.nn.Module, rows: str = "token") -> None:
+        """State how ``module`` treats the rows it is given.
+
+        ``"token"``: every call of it is token-wise, and its calls are shared
+        like any token-wise call.
+
+        ``"span"``: it reduces over each caller's own rows. A worker calls it
+        as ``module(rows, ...)`` with ``rows`` its only tensor argument, and the
+        coalescer makes the call ``module(rows, ..., sizes=[n_1, ..., n_K])``:
+        ``rows`` is the K callers' rows concatenated, ``n_i`` is caller ``i``'s
+        row count, and the result is a tensor or a list ``K`` long whose item
+        ``i`` is caller ``i``'s. One caller alone is ``K = 1``. A call that does
+        not go through the coalescer (``hook=True``, or outside a worker) is
+        passed to the module as written, without ``sizes``.
+
+        Either is taken as given: a module that lets one caller's rows into
+        another's result lets one worker's values reach another's.
+        """
+        if rows not in ("token", "span"):
+            raise ValueError(f"rows must be 'token' or 'span', got {rows!r}")
+        self.registered[module] = rows
 
     def shares(self, call: Call) -> bool:
         """Whether ``call`` may run together with other workers' calls."""
         return call.envoy._module in self.registered or self.tokenwise(call)
+
+    def spans(self, call: Call) -> bool:
+        """Whether ``call`` is of a module registered ``rows="span"``."""
+        return self.registered.get(call.envoy._module) == "span"
 
     def run(self, calls: list) -> list:
         """Run ``calls``, each a ``(worker, Call)``; return ``(worker, Outcome)``
@@ -259,17 +327,21 @@ class Coalescer:
         """
         args, kwargs = group.arguments()
         try:
-            result = group.call.envoy._run(*args, **kwargs)
+            if self.spans(group.call):
+                sizes = [span(call) for _, call in group.members]
+                pieces = each(group.call.envoy._run(*args, **kwargs, sizes=sizes), len(sizes))
+            else:
+                pieces = split(group.call.envoy._run(*args, **kwargs), group.sizes)
         except Exception:
             return None
-        try:
-            return [Outcome(piece) for piece in split(result, group.sizes)]
-        except Unsplittable:
-            return None
+        return [Outcome(piece) for piece in pieces]
 
     def alone(self, call: Call) -> Outcome:
         """``call`` run on its caller's arguments only."""
         try:
+            if self.spans(call):
+                result = call.envoy._run(*call.args, **call.kwargs, sizes=[span(call)])
+                return Outcome(each(result, 1)[0])
             return Outcome(call.envoy._run(*call.args, **call.kwargs))
         except Exception as error:
             return Outcome(error=error)

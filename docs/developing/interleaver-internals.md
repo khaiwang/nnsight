@@ -137,8 +137,23 @@ call on its caller's arguments alone. The coalescer runs nothing to find that
 out. The runtime passes a predicate over the `Call` when it builds the coalescer
 (`Coalescer(tokenwise)`), which has to answer from what every process running
 the block sees alike, such as the module's class and the number of arguments.
-`Coalescer.register(module)` adds one module whatever its class. It applies to
-modules reached through an envoy, and nothing on a vLLM client reaches it yet.
+`Coalescer.register(module, rows="token")` adds one module whatever its class.
+
+`register(module, rows="span")` is for a module that reduces over each caller's
+own rows. A worker calls it as `module(rows, ...)` with `rows` its first
+positional argument and its only tensor (`coalesce.span` raises `TypeError` on
+any other form). The calls are grouped the same way, and the one call is
+`module(rows, ..., sizes=[n_1, ..., n_K])` on the callers' rows concatenated;
+the result has to be a tensor or a list `K` long, and caller `i` is resumed
+with item `i` (`coalesce.each`). A caller alone is the same call with `K = 1`.
+A shared call that raises, or returns another count, is made again for each
+caller alone; a caller whose own call fails gets that error. A call that does
+not park (`hook=True`, or outside a worker) reaches the module as written,
+without `sizes`.
+
+`register` applies to modules reached through an envoy. On vLLM,
+`VLLM.attach(name, module, rows=...)` puts a module of the user's in the
+worker's tree and registers it.
 
 Whoever switches into workers calls `settle` afterwards: `Interleaver.handle`
 after serving a visit, `__enter__` after starting workers, and the vLLM runner
