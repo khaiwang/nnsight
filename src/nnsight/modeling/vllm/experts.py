@@ -20,8 +20,14 @@ computed for the requesting invoke.
   routing weight. The kernel never stores it, so the selected rows are
   recomputed from the activation rows and the expert's down-projection weight.
 
+Under expert parallelism each rank holds a share of the experts and runs only
+the pairs routed to them, so the reader declares ``slot`` and ``expert`` as
+`ROUTED`: a rank returns zeros for the pairs of experts it does not hold, and
+`Sites.read` sums the ranks.
+
 Not served: other experts kernels (FlashInfer, batched Triton, quantized),
-LoRA, and tensor or expert parallelism.
+LoRA, and tensor parallelism without expert parallelism, where each rank holds
+a share of every expert's intermediate width.
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ from typing import Any, Callable
 import torch
 
 from ...intervention.kernel import Attr, Located, Spec, unshimmed
-from ...intervention.sites import Batch, Provenance, Sites, Unavailable
+from ...intervention.sites import ROUTED, Batch, Provenance, Sites, Unavailable
 from ...intervention.source import arguments
 from ..kernels.experts import Experts
 
@@ -97,14 +103,15 @@ def serve(fn: Callable, args: tuple, kwargs: dict) -> tuple[Any, Sites]:
     call = calls[0]
     bound, inputs, index = call["bound"], call["inputs"], call["index"]
     experts = bound["self"]
-    if _tp_world_size() > 1 or bound["expert_map"] is not None:
-        return output, Unavailable(f"{NAME}: kernel sites are not served under tensor or expert parallelism")
+    local = bound["expert_map"]
+    if _tp_world_size() > 1 and local is None:
+        return output, Unavailable(f"{NAME}: kernel sites are not served under tensor parallelism without expert parallelism")
     if experts._lora_context is not None or experts.quant_dtype is not None or experts.weight_quant_dtype is not None:
         return output, Unavailable(f"{NAME}: kernel sites are not served with LoRA or quantization")
     pairs = index.numel()
     if len(inputs) != 2 or inputs[1].shape[0] != pairs or inputs[1].shape[1] != bound["w2"].shape[2]:
         return output, Unavailable(f"{NAME} ran {len(inputs)} fused multiplies with inputs {[tuple(v.shape) for v in inputs]}; expected two, the second over {pairs} activation rows")
-    return output, Routed(call["hidden"], inputs[1], index, bound["w2"], experts.w2_bias)
+    return output, Routed(call["hidden"], inputs[1], index, bound["w2"], experts.w2_bias, local, bound["global_num_experts"])
 
 
 class Routed(Sites):
@@ -114,43 +121,77 @@ class Routed(Sites):
     axes = Experts.axes
     narrowed = True
 
-    def __init__(self, hidden: torch.Tensor, activation: torch.Tensor, index: torch.Tensor, w2: torch.Tensor, bias: torch.Tensor | None) -> None:
+    def __init__(
+        self,
+        hidden: torch.Tensor,
+        activation: torch.Tensor,
+        index: torch.Tensor,
+        w2: torch.Tensor,
+        bias: torch.Tensor | None,
+        local: torch.Tensor | None,
+        num_experts: int,
+    ) -> None:
         self.hidden, self.activation, self.index, self.w2, self.bias = hidden, activation, index, w2, bias
+        #: Under expert parallelism, each expert's row in this rank's weights, or -1 for an expert on another rank.
+        self.local = local
+        self.num_experts = num_experts
+        self.layout = {} if local is None else {"tp": {"slot": ROUTED, "expert": ROUTED}}
+        self.batch: Batch | None = None
 
     def read(self, site: str, spec: dict[str, Any], batch: Batch | None) -> tuple[torch.Tensor, Provenance]:
+        self.batch = batch
+        return super().read(site, spec, batch)
+
+    def _site(self, site: str, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
         tokens, top_k = self.index.shape
-        start, size = (0, tokens) if batch is None else (batch.start, batch.size)
+        start, size = (0, tokens) if self.batch is None else (self.batch.start, self.batch.size)
         if start + size > tokens:
             raise ValueError(f"kernel sites: the worker's rows [{start}, {start + size}) are outside the {tokens} token rows of this call")
         rows = slice(start, start + size)
         activation = self.activation.view(tokens, top_k, -1)[rows].flatten(0, 1)
-        return _Request(self.hidden[rows], activation, self.index[rows], self.w2, self.bias).read(site, spec, None)
+        return _Request(self, self.hidden[rows], activation, self.index[rows]).read(site, spec, None)
+
+    def expert_input(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
+        return self._site("expert_input", spec)
+
+    def expert_activation(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
+        return self._site("expert_activation", spec)
+
+    def expert_output(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
+        return self._site("expert_output", spec)
 
 
 class _Request(Experts):
     """One request's rows of a `Routed` call, read with the transformers reader's selection rules."""
 
-    def __init__(self, hidden: torch.Tensor, activation: torch.Tensor, index: torch.Tensor, w2: torch.Tensor, bias: torch.Tensor | None) -> None:
-        super().__init__({"expert_activation": activation}, None, index, w2.shape[0], NAME)
-        self.hidden, self.w2, self.bias = hidden, w2, bias
+    def __init__(self, call: Routed, hidden: torch.Tensor, activation: torch.Tensor, index: torch.Tensor) -> None:
+        super().__init__({"expert_activation": activation}, None, index, call.num_experts, NAME)
+        self.call, self.hidden = call, hidden
 
     def kind(self, name: str) -> str:
         return "replay" if name == "expert_output" else "exact export"
 
     def gather(self, name: str, pairs: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        call = self.call
+        # Each selected pair's expert as a row of this rank's weights; -1 for an expert on another rank.
+        expert = self.top_k_index.reshape(-1)[pairs].long()
+        if call.local is not None:
+            expert = call.local[expert].long()
+        held = (expert >= 0).unsqueeze(-1)
         if name == "expert_input":
-            return self.hidden[pairs // self.top_k_index.shape[1]]
-        activation = super().gather("expert_activation", pairs, index)
+            return self.hidden[pairs // self.top_k_index.shape[1]] * held
+        # The kernel never writes the rows of another rank's experts, so those hold whatever the workspace had.
+        activation = torch.where(held, super().gather("expert_activation", pairs, index), 0)
         if name == "expert_activation":
             return activation
         # The down projection of each selected row by its own expert, one multiply per expert present.
-        index = self.top_k_index.reshape(-1)[pairs].long()
-        output = activation.new_zeros((*pairs.shape, self.w2.shape[1]), dtype=self.w2.dtype)
-        for expert in index.unique().tolist():
-            mask = index == expert
-            output[mask] = activation[mask].to(self.w2.dtype) @ self.w2[expert].T
-            if self.bias is not None:
-                output[mask] += self.bias[expert]
+        w2 = call.w2
+        output = activation.new_zeros((*pairs.shape, w2.shape[1]), dtype=w2.dtype)
+        for row in expert[expert >= 0].unique().tolist():
+            mask = expert == row
+            output[mask] = activation[mask].to(w2.dtype) @ w2[row].T
+            if call.bias is not None:
+                output[mask] += call.bias[row]
         return output
 
 

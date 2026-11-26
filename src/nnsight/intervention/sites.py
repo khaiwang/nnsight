@@ -48,6 +48,9 @@ call inside a module that is split:
 
 * `WHOLE` (the default): every rank holds the full axis with the same values.
 * `SPLIT`: each rank holds one contiguous block of equal length, in rank order.
+* `ROUTED`: every rank indexes the full axis, and each entry is held by one
+  rank, chosen by the data (a routed expert lives on one rank). The site method
+  returns zeros at the entries its rank does not hold, and the ranks are summed.
 
 `Sites.read` translates a request from those declarations. For each `SPLIT` axis
 it maps the requested logical positions to this rank's local ones, asks the
@@ -105,6 +108,7 @@ torch.serialization.add_safe_globals([Provenance])
 #: Axis layouts across ranks; see the module docstring.
 WHOLE = "whole"
 SPLIT = "split"
+ROUTED = "routed"
 
 
 class Ranks(NamedTuple):
@@ -168,9 +172,12 @@ class Sites:
         names = self.axes[site]
         check_axes(spec, site, names)
         ranks = self.ranks
-        split = [] if ranks is None else [name for name in names if self.layout[ranks.mode].get(name, WHOLE) == SPLIT]
+        layouts = {} if ranks is None else {name: self.layout[ranks.mode].get(name, WHOLE) for name in names}
+        split = [name for name in names if layouts.get(name) == SPLIT]
         if not split:
-            return getattr(self, site)(spec)
+            value, provenance = getattr(self, site)(spec)
+            # A routed axis needs no index translation: each rank's zeros stand for the entries the others hold.
+            return (ranks.reduce(value) if ROUTED in layouts.values() else value), provenance
         # Ask the site for the positions this rank holds, in local indices.
         local = dict(spec)
         placed = []

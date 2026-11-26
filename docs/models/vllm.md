@@ -544,8 +544,17 @@ activation and output rows equal an fp32 computation from the layer's weights
 to 1% of each row's largest entry, and the weighted sum plus the shared experts
 equals the module output to 0.7% per token.
 
+Under expert parallelism (`tensor_parallel_size=2, enable_expert_parallel=True`)
+each rank holds a share of the experts and runs only the pairs routed to them.
+The sites sum the ranks, so a read returns every routed pair's row, as on one
+rank. On DeepSeek-V2-Lite layer 3 with two ranks, the three sites equal the
+one-rank engine to 2% of the largest entry, which is also how much the layer's
+input differs between the two engines.
+
 Not served: other experts kernels (FlashInfer, batched Triton, quantized
-weights or activations), LoRA, and tensor or expert parallelism.
+weights or activations), LoRA, and tensor parallelism without expert
+parallelism, where each rank holds a share of every expert's intermediate
+width.
 
 ## CUDA graphs with taps
 

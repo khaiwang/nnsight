@@ -20,11 +20,21 @@ LONG = "The Eiffel Tower is located in the city of Paris and " * 3
 SHORT = "The capital of Japan is"
 
 
-@pytest.fixture(scope="module")
-def engine():
+#: Values the one-rank engine read, for the expert-parallel engine to compare against.
+ONE_RANK: dict = {}
+
+
+@pytest.fixture(scope="module", params=["one_rank", "expert_parallel"])
+def engine(request):
     from nnsight.modeling.vllm import VLLM
 
     os.environ["VLLM_MLA_DISABLE"] = "1"
+    kwargs = {}
+    if request.param == "expert_parallel":
+        if torch.cuda.device_count() < 2:
+            pytest.skip("expert parallelism needs two GPUs")
+        # Two ranks, each holding half of every layer's routed experts.
+        kwargs = {"tensor_parallel_size": 2, "enable_expert_parallel": True}
     return VLLM(
         REPO,
         gpu_memory_utilization=0.6,
@@ -32,10 +42,13 @@ def engine():
         trust_remote_code=True,
         dispatch=True,
         compilation_config={"custom_ops": ["-rotary_embedding"]},
+        **kwargs,
     )
 
 
-def test_rows_match_the_layers_weights(engine):
+def test_rows_match_the_layers_weights(engine, request):
+    if "expert_parallel" in request.node.name:
+        pytest.skip("a rank holds half of the experts' weights, so the reference is computed on one rank")
     mlp = engine.model.layers[3].mlp
     experts = mlp.experts
     with engine.trace(temperature=0.0, max_tokens=2) as tracer:
@@ -106,3 +119,35 @@ def test_selection(engine):
     routed = (ids == expert).any(-1)
     assert routed[0] and (one[~routed] == 0).all()
     assert torch.allclose(one[0], output[0, 0], rtol=2e-2, atol=2e-2 * float(output[0, 0].abs().max()))
+
+
+def test_expert_parallel_matches_one_rank(engine, request):
+    """Every routed pair is held by exactly one rank, so the summed ranks equal the one-rank rows; a dropped pair would read 0."""
+    mlp = engine.model.layers[3].mlp
+    kernel = mlp.experts.kernel
+    with engine.trace(temperature=0.0, max_tokens=2) as tracer:
+        with tracer.invoke(SHORT):
+            pass
+        with tracer.invoke(LONG):
+            steps = list().save()
+            for _ in tracer.iter[:2]:
+                logits = mlp.gate.output[0].float().clone()
+                steps.append(
+                    [
+                        kernel.expert_input().float().clone(),
+                        kernel.expert_activation().float().clone(),
+                        kernel.expert_output().float().clone(),
+                        kernel.expert_output(tokens=-1, slot=[4, 1]).float().clone(),
+                        kernel.expert_activation(expert=int(logits[0].argmax())).float().clone(),
+                    ]
+                )
+    steps = [[value.cpu() for value in step] for step in steps]
+    if "one_rank" in request.node.name:
+        ONE_RANK["steps"] = steps
+        return
+    # The two engines' layer inputs already differ by 2% of the largest entry.
+    for step, expected in zip(steps, ONE_RANK["steps"]):
+        for value, reference in zip(step, expected):
+            assert value.shape == reference.shape
+            assert float((value - reference).abs().max() / reference.abs().max()) < 5e-2
+        assert (step[2].abs().amax(-1) > 0).all()

@@ -510,6 +510,7 @@ The layouts:
 |---|---|---|
 | `WHOLE` | The full axis, with the same values on every rank. | Passes the caller's index through. |
 | `SPLIT` | One contiguous block of `local(axis)` positions, in rank order. | Maps each requested position to its owner rank and local index, asks the site method for this rank's positions, places them into zeros of the requested shape, and sums the ranks with `ranks.reduce`. |
+| `ROUTED` | The full axis, with each entry held by one rank chosen by the data (a routed expert lives on one rank). | Passes the request through unchanged; the site method returns zeros at the entries its rank does not hold, and the ranks are summed with `ranks.reduce`. |
 
 Indices are logical on every runtime: `heads=9` is head 9 of the model, whether
 one process holds all heads or eight ranks hold a block each. With 14 heads on
@@ -552,7 +553,7 @@ What each served reader declares:
 | `scaled_dot_product_attention`, eager and FlashAttention 2 in transformers (`intervention/attention.py`) | `lse` [heads, query]; `scores`, `probs` [heads, query, key] | 1 | heads `SPLIT`; query and key `WHOLE` |
 | Recurrent scans in transformers (`modeling/kernels/recurrent.py`) | `chunk_states` [chunks, heads]; `states` [tokens, heads] | 1 | all `WHOLE` |
 | vLLM gated delta rule layer (`modeling/vllm/recurrent.py`) | `chunk_states` [chunks, heads]; `states` [tokens, heads] | 0 | `tp`: `heads` `SPLIT` |
-| vLLM Triton experts kernel (`modeling/vllm/experts.py`) | `expert_input`, `expert_activation`, `expert_output` [tokens, slot or expert] | 0 | not served |
+| vLLM Triton experts kernel (`modeling/vllm/experts.py`) | `expert_input`, `expert_activation`, `expert_output` [tokens, slot or expert] | 0 | expert parallelism: `slot` and `expert` `ROUTED`; tensor parallelism alone: not served |
 | Experts forwards in transformers (`modeling/kernels/experts.py`) | per-pair rows [tokens, slot], with `expert=` selecting in place of `slot` | none | not served |
 
 The layouts still to add, and the kernels that need them, are listed in the
