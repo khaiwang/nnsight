@@ -528,7 +528,7 @@ with model.trace(prompt, max_tokens=1, temperature=0.0):
 | Site | Shape | Value |
 |------|-------|-------|
 | `expert_input` | `[tokens, top_k, hidden]` | The layer's input row. |
-| `expert_activation` | `[tokens, top_k, intermediate]` | The kernel's own activation rows, copied before vLLM reuses the workspace. |
+| `expert_activation` | `[tokens, top_k, width]` | The kernel's own activation rows, copied before vLLM reuses the workspace. |
 | `expert_output` | `[tokens, top_k, hidden]` | The down projection before the routing weight. The kernel multiplies by the routing weight in the same pass and never stores this row, so the selected rows are recomputed from the activation rows and the expert's weight (provenance `replay`). |
 
 There is no batch axis, and an invoke reads only its own tokens of the step.
@@ -551,10 +551,17 @@ rank. On DeepSeek-V2-Lite layer 3 with two ranks, the three sites equal the
 one-rank engine to 2% of the largest entry, which is also how much the layer's
 input differs between the two engines.
 
+Under tensor parallelism without expert parallelism each rank holds every
+expert, cut to one block of its intermediate width. The activation rows are
+joined along the width, and `expert_output` is the sum of the ranks' partial
+down projections. On DeepSeek-V2-Lite layer 3 with two ranks the three sites
+equal the one-rank engine to within 5% of the largest entry (the test's bound).
+
+`expert_activation` also takes `width=` to select intermediate units, on one
+rank and across ranks: `kernel.expert_activation(tokens=-1, width=[3, 700])`.
+
 Not served: other experts kernels (FlashInfer, batched Triton, quantized
-weights or activations), LoRA, and tensor parallelism without expert
-parallelism, where each rank holds a share of every expert's intermediate
-width.
+weights or activations) and LoRA.
 
 ## CUDA graphs with taps
 

@@ -16,7 +16,7 @@ returned in the dtype used by the forward pass:
 
 * ``expert_input(tokens=, slot=)``: the input row received by each routed pair's
   expert.
-* ``expert_activation(tokens=, slot=)``: the intermediate activation between the
+* ``expert_activation(tokens=, slot=, width=)``: the intermediate activation between the
   two projections (``act(gate) * up``, or ``act(up)`` for experts without a gate).
 * ``expert_output(tokens=, slot=)``: the down-projected row before multiplying
   by the routing weight. Summing these rows multiplied by ``top_k_weights`` across
@@ -76,7 +76,8 @@ class Experts(Sites):
 
     names = tuple(_ROWS)
     #: ``expert=`` selects one expert's rows in place of the ``slot`` axis.
-    axes = dict.fromkeys(_ROWS, ("tokens", "slot", "expert"))
+    #: ``width=`` selects intermediate units of the activation rows.
+    axes = {**dict.fromkeys(_ROWS, ("tokens", "slot", "expert")), "expert_activation": ("tokens", "slot", "expert", "width")}
 
     def __init__(
         self,
@@ -137,6 +138,9 @@ class Experts(Sites):
         else:
             value = sites.squeeze(value, spec, {"slot": axis + 1, "tokens": axis})
             note = f"the forward's {_ROWS[name]} in token order; slot k is the token's k-th routed expert (top_k_index[..., k])"
+        if "width" in spec:
+            value = sites.select(value, value.dim() - 1, sites.indices(spec["width"], value.shape[-1], value.device))
+            value = sites.squeeze(value, spec, {"width": value.dim() - 1})
         return value, Provenance(self.kind(name), self.op_name, note)
 
     def kind(self, name: str) -> str:

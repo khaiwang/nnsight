@@ -404,7 +404,7 @@ with model.trace(prompt):
 | Site | Value | Provenance |
 |---|---|---|
 | `expert_input(tokens=, slot=)` | the row the pair's expert received, `[.., top_k, hidden]` | `exact export` |
-| `expert_activation(tokens=, slot=)` | the activation between the two projections, `act(gate) * up` (or `act(up)` for experts without a gate), `[.., top_k, intermediate]` | `exact export` |
+| `expert_activation(tokens=, slot=, width=)` | the activation between the two projections, `act(gate) * up` (or `act(up)` for experts without a gate), `[.., top_k, intermediate]` | `exact export` |
 | `expert_output(tokens=, slot=)` | the pair's down projection before its routing weight, `[.., top_k, hidden]`; the module's output is the sum over slots of these rows times `top_k_weights`, cast to the input dtype | `exact export` |
 
 Slot `k` is the token's k-th routed expert, `top_k_index[token, k]`. Passing
@@ -553,7 +553,7 @@ What each served reader declares:
 | `scaled_dot_product_attention`, eager and FlashAttention 2 in transformers (`intervention/attention.py`) | `lse` [heads, query]; `scores`, `probs` [heads, query, key] | 1 | heads `SPLIT`; query and key `WHOLE` |
 | Recurrent scans in transformers (`modeling/kernels/recurrent.py`) | `chunk_states` [chunks, heads]; `states` [tokens, heads] | 1 | all `WHOLE` |
 | vLLM gated delta rule layer (`modeling/vllm/recurrent.py`) | `chunk_states` [chunks, heads]; `states` [tokens, heads] | 0 | `tp`: `heads` `SPLIT` |
-| vLLM Triton experts kernel (`modeling/vllm/experts.py`) | `expert_input`, `expert_activation`, `expert_output` [tokens, slot or expert] | 0 | expert parallelism: `slot` and `expert` `ROUTED`; tensor parallelism alone: not served |
+| vLLM Triton experts kernel (`modeling/vllm/experts.py`) | `expert_input`, `expert_activation`, `expert_output` [tokens, slot or expert] | 0 | expert parallelism: `slot` and `expert` `ROUTED`; tensor parallelism alone: `width` of `expert_activation` `SPLIT`, `expert_output` summed over ranks |
 | Experts forwards in transformers (`modeling/kernels/experts.py`) | per-pair rows [tokens, slot], with `expert=` selecting in place of `slot` | none | not served |
 
 The layouts still to add, and the kernels that need them, are listed in the

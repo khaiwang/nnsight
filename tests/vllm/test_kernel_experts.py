@@ -24,7 +24,7 @@ SHORT = "The capital of Japan is"
 ONE_RANK: dict = {}
 
 
-@pytest.fixture(scope="module", params=["one_rank", "expert_parallel"])
+@pytest.fixture(scope="module", params=["one_rank", "expert_parallel", "tensor_parallel"])
 def engine(request):
     from nnsight.modeling.vllm import VLLM
 
@@ -35,6 +35,11 @@ def engine(request):
             pytest.skip("expert parallelism needs two GPUs")
         # Two ranks, each holding half of every layer's routed experts.
         kwargs = {"tensor_parallel_size": 2, "enable_expert_parallel": True}
+    if request.param == "tensor_parallel":
+        if torch.cuda.device_count() < 2:
+            pytest.skip("tensor parallelism needs two GPUs")
+        # Two ranks, each holding half of every expert's intermediate width.
+        kwargs = {"tensor_parallel_size": 2}
     return VLLM(
         REPO,
         gpu_memory_utilization=0.6,
@@ -47,8 +52,8 @@ def engine(request):
 
 
 def test_rows_match_the_layers_weights(engine, request):
-    if "expert_parallel" in request.node.name:
-        pytest.skip("a rank holds half of the experts' weights, so the reference is computed on one rank")
+    if "one_rank" not in request.node.name:
+        pytest.skip("a rank holds a share of the experts' weights, so the reference is computed on one rank")
     mlp = engine.model.layers[3].mlp
     experts = mlp.experts
     with engine.trace(temperature=0.0, max_tokens=2) as tracer:
@@ -108,12 +113,17 @@ def test_selection(engine):
         activation = kernel.expert_activation().clone().save()
         output = kernel.expert_output().float().save()
         some = kernel.expert_activation(tokens=-1, slot=[4, 1]).clone().save()
+        units = kernel.expert_activation(tokens=[2, 5], width=[1407, 3, 700]).clone().save()
+        unit = kernel.expert_activation(slot=0, width=704).clone().save()
         rows = kernel.expert_output(tokens=[0, -1], slot=2).float().save()
         one = kernel.expert_output(expert=int(logits[0].argmax())).float().save()
     expert = int(logits[0].argmax())
     ids = logits.topk(activation.shape[1], dim=-1).indices
     assert activation.shape == (37, 6, 1408) and output.shape == (37, 6, 2048)
     assert torch.equal(some, activation[-1, [4, 1]])
+    # Units 3 and 700 are on the first rank and 704 and 1407 on the second when the width is split in two.
+    assert torch.equal(units, activation[[2, 5]][..., [1407, 3, 700]])
+    assert torch.equal(unit, activation[:, 0, 704])
     # A recomputed subset is a different bf16 matrix product from the full one.
     assert torch.allclose(rows, output[[0, -1], 2], rtol=2e-2, atol=2e-2 * float(output[[0, -1], 2].abs().max()))
     routed = (ids == expert).any(-1)
@@ -121,8 +131,8 @@ def test_selection(engine):
     assert torch.allclose(one[0], output[0, 0], rtol=2e-2, atol=2e-2 * float(output[0, 0].abs().max()))
 
 
-def test_expert_parallel_matches_one_rank(engine, request):
-    """Every routed pair is held by exactly one rank, so the summed ranks equal the one-rank rows; a dropped pair would read 0."""
+def test_two_ranks_match_one_rank(engine, request):
+    """The ranks' pieces assemble into the one-rank rows; a dropped pair or a missing half of the width would read 0."""
     mlp = engine.model.layers[3].mlp
     kernel = mlp.experts.kernel
     with engine.trace(temperature=0.0, max_tokens=2) as tracer:
@@ -151,3 +161,5 @@ def test_expert_parallel_matches_one_rank(engine, request):
             assert value.shape == reference.shape
             assert float((value - reference).abs().max() / reference.abs().max()) < 5e-2
         assert (step[2].abs().amax(-1) > 0).all()
+        half = step[1].shape[-1] // 2
+        assert (step[1][..., :half].abs().amax(-1) > 0).all() and (step[1][..., half:].abs().amax(-1) > 0).all()

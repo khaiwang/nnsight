@@ -177,7 +177,8 @@ class Sites:
         if not split:
             value, provenance = getattr(self, site)(spec)
             # A routed axis needs no index translation: each rank's zeros stand for the entries the others hold.
-            return (ranks.reduce(value) if ROUTED in layouts.values() else value), provenance
+            # A sliced value can be a strided view, which a collective would read as if it were contiguous.
+            return (ranks.reduce(value.contiguous()) if ROUTED in layouts.values() else value), provenance
         # Ask the site for the positions this rank holds, in local indices.
         local = dict(spec)
         placed = []
@@ -191,12 +192,16 @@ class Sites:
         # Put them where the request wants them, among zeros for the other ranks' positions, and sum the ranks.
         dims = {}
         for name, outs, count in placed:
-            earlier = names[: names.index(name)]
-            dim = dims[name] = self.lead + len(earlier) - sum(isinstance(local.get(other), int) for other in earlier)
+            dim = dims[name] = self.dim(site, name, local)
             shape = list(value.shape)
             shape[dim] = count
             value = value.new_zeros(shape).index_copy_(dim, torch.tensor(outs, dtype=torch.long, device=value.device), value)
         return squeeze(ranks.reduce(value), spec, dims), provenance
+
+    def dim(self, site: str, axis: str, spec: dict[str, Any]) -> int:
+        """The dimension of ``axis`` in the value a site method returns for ``spec``: after ``lead``, counting the earlier axes ``spec`` does not index with one int."""
+        earlier = self.axes[site][: self.axes[site].index(axis)]
+        return self.lead + len(earlier) - sum(isinstance(spec.get(other), int) for other in earlier)
 
     def local(self, axis: str) -> int:
         """Length of a `SPLIT` axis on this rank. A reader that declares one implements this."""

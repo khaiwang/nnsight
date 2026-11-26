@@ -1304,6 +1304,17 @@ def _per_pair(experts_module, x, index):
 
 
 class TestExperts:
+    def test_width_selects_units_of_the_activation_rows(self, moe):
+        kernel = moe.model.layers[0].mlp.experts.kernel
+        with moe.trace(_ids(7)):
+            act = kernel.expert_activation().save()
+            some = kernel.expert_activation(tokens=-1, width=[23, 0, 5]).save()
+            one = kernel.expert_activation(slot=1, width=4).save()
+            with pytest.raises(ValueError, match="takes tokens, slot, expert"):
+                kernel.expert_output(width=0)
+        assert torch.equal(some, act[:, -1][..., [23, 0, 5]])
+        assert torch.equal(one, act[:, :, 1, 4])
+
     def test_pair_buffers_match_a_per_pair_computation(self, moe):
         experts = moe.model.layers[0].mlp.experts
         ids = _ids(7)
