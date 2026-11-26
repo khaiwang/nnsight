@@ -49,7 +49,7 @@ VLLM(
 | `dispatch` | `True` creates the real engine during `__init__`. `False` (default) builds only a meta-tensor tree (via vLLM's `DummyModelLoader`, `device="meta"`) — no GPU memory used until the first trace. |
 | `tensor_parallel_size` | GPUs to shard across. Transparent to your interventions (see [Parallelism and architectures](vllm-parallelism.md)). |
 | `gpu_memory_utilization` | vLLM KV-cache budget (default 0.9). Lower it (e.g. 0.1) for small models / shared GPUs. |
-| `taps` | Module locations to serve with CUDA graphs **on** — `"model.layers.*.output"`, `*` one path segment. Empty (default) runs the engine eagerly, where every location is served. See [CUDA graphs with taps](#cuda-graphs-with-taps). |
+| `taps` | Module locations to serve with CUDA graphs **on** — `"model.layers.*.output"`, `*` one path segment, or a layer's [kernel sites](#attention-kernel-sites), `"model.layers.*.self_attn.attn.kernel"`. Empty (default) runs the engine eagerly, where every location is served. See [CUDA graphs with taps](#cuda-graphs-with-taps). |
 | `**vllm_kwargs` | Anything valid for `vllm.LLM` / `AsyncEngineArgs`. |
 
 The NNsight worker class is always forced internally, and so is `enforce_eager=True` unless you declare `taps` — CUDA graphs freeze the ops they replay, so an ordinary hook can't fire inside one.
@@ -437,8 +437,23 @@ A site still returns every head, and `heads=` indexes the model's heads: each
 rank fills the heads it holds and one sum over the ranks assembles the value
 ([the reader contract](../usage/kernel.md#the-reader-contract-axes-and-their-layout-across-ranks)).
 On Qwen2.5-0.5B at `tensor_parallel_size=2`, layer 0 equals the one-rank values
-to 1e-5. The sites are not served under `taps` or on other
-attention backends (Triton, FlashInfer, MLA).
+to 1e-5.
+
+On an engine built with `taps`, declare the kernel sites as a tap, by the
+attention layer's path with `.kernel` on the end:
+
+```python
+model = VLLM("gpt2", dispatch=True, taps=["transformer.h.*.attn.attn.kernel", "transformer.h.*.output"])
+```
+
+The sites are then served on every replayed step with the values of the eager
+engine (equal on GPT-2 over a prefill and two decode steps). vLLM runs its
+attention op in Python on every replay, between graph segments, so a kernel tap
+adds no graph break of its own to the attention call; it records two small
+callables around the layer. A kernel site that is not a tap raises the same
+"is not a tap on this engine" error as any other untapped location.
+
+The sites are not served on other attention backends (Triton, FlashInfer, MLA).
 
 ## CUDA graphs with taps
 

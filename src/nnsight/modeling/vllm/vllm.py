@@ -430,13 +430,15 @@ class VLLM(Remotable):
                 op = None
             pattern = re.escape(prefix).replace(r"\*", r"[^.]+")
             matched = [name for name in names if re.fullmatch(pattern, name)]
-            if side not in ("input", "output") or not matched or (sourced and not op):
+            sides = ("input", "output") if sourced else ("input", "output", "kernel")
+            if side not in sides or not matched or (sourced and not op):
                 raise ValueError(
                     f"Tap {tap!r} names no module. A tap is a module path ending in "
                     ".input or .output, where * stands for one path segment — "
-                    "'model.layers.*.output' for every decoder layer's output — or "
+                    "'model.layers.*.output' for every decoder layer's output — "
                     "an operation inside a module's forward, "
-                    "'model.layers.10.self_attn.source.qkv_split_0.output'."
+                    "'model.layers.10.self_attn.source.qkv_split_0.output', or a "
+                    "module's kernel sites, 'model.layers.*.self_attn.attn.kernel'."
                 )
             # Under the worker's root envoy, which is built with Envoy's default
             # path — the client's own is not set yet on `dispatch=True`.

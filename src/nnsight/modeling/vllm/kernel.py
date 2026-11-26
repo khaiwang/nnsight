@@ -30,9 +30,12 @@ another dtype than the queries such as fp8, a call without a block table, or
 one of the several calls vLLM merges under cascade or context-parallel
 attention) are served as `Unavailable`.
 
-`CATALOG` has one row, registered in the worker process (`register_kernels`), on the eager
-engine: under ``taps`` a replayed step runs no module controller, so the shim
-finds no running module and the site is not served.
+`CATALOG` has one row, registered in the worker process (`register_kernels`).
+On an engine replaying CUDA graphs the sites are served for the modules whose
+``.kernel`` location is a tap: vLLM runs its attention op as an eager break on
+every replay, which reaches the shim, and
+[`VLLMInterleaver`][nnsight.modeling.vllm.interleaver.VLLMInterleaver] records
+which module that call belongs to.
 """
 
 from __future__ import annotations

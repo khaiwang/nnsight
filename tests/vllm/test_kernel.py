@@ -139,3 +139,72 @@ def test_tensor_parallel_ranks_serve_every_head(vllm_qwen_ref, vllm_qwen_tp):
         for expected, value in zip(whole, sharded):
             assert value.shape == expected.shape
             assert torch.allclose(value, expected, atol=1e-5)
+
+
+@pytest.fixture(scope="module")
+def vllm_gpt2_kernel_taps():
+    """A gpt2 replaying CUDA graphs, with every attention layer's kernel sites tapped.
+
+    Layer 0's attention output is tapped as well and layer 5's is not, so both
+    ways a replayed step counts the visit a kernel site is scheduled by are run.
+    """
+    from nnsight.modeling.vllm import VLLM
+
+    return VLLM(
+        "gpt2",
+        gpu_memory_utilization=0.1,
+        dispatch=True,
+        taps=["transformer.h.*.attn.attn.kernel", "transformer.h.0.attn.attn.output", "transformer.h.7.output"],
+    )
+
+
+def _steps(model, prompt, layers=(0, 5), count=3):
+    with model.trace(prompt, max_tokens=count, temperature=0.0) as tracer:
+        steps = list().save()
+        for _ in tracer.iter[:count]:
+            row = []
+            for layer in layers:
+                attn = model.transformer.h[layer].attn.attn
+                row.append(attn.kernel.probs().clone())
+                row.append(attn.kernel.lse(query=-1, heads=[3, 9]).clone())
+            steps.append(row)
+    return steps
+
+
+def test_taps_serve_kernel_sites_on_every_replayed_step(vllm_gpt2_kernel_taps, vllm_gpt2):
+    assert "model.transformer.h.5.attn.attn.kernel" in vllm_gpt2_kernel_taps.taps
+    eager = _steps(vllm_gpt2, PROMPT)
+    tapped = _steps(vllm_gpt2_kernel_taps, PROMPT)
+    assert len(tapped) == len(eager) == 3
+    for expected_row, row in zip(eager, tapped):
+        for expected, value in zip(expected_row, row):
+            assert value.shape == expected.shape
+            assert torch.allclose(value, expected, atol=1e-5)
+
+
+def test_taps_serve_a_kernel_site_beside_the_module_output(vllm_gpt2_kernel_taps):
+    attn = vllm_gpt2_kernel_taps.transformer.h[0].attn.attn
+    with vllm_gpt2_kernel_taps.trace(PROMPT, max_tokens=3, temperature=0.0) as tracer:
+        keys = list().save()
+        for _ in tracer.iter[:3]:
+            probs = attn.kernel.probs(query=-1)
+            attn.output.clone()
+            keys.append(probs.shape[-1])
+    assert keys[1] == keys[0] + 1 and keys[2] == keys[0] + 2
+
+
+def test_taps_serve_each_invoke_its_own_request(vllm_gpt2_kernel_taps, vllm_gpt2):
+    other = "Madison Square Garden is in"
+
+    def read(model):
+        attn = model.transformer.h[LAYER].attn.attn
+        with model.trace(temperature=0.0, max_tokens=1) as tracer:
+            with tracer.invoke(PROMPT):
+                first = attn.kernel.probs().save()
+            with tracer.invoke(other):
+                second = attn.kernel.probs().save()
+        return first, second
+
+    for expected, value in zip(read(vllm_gpt2), read(vllm_gpt2_kernel_taps)):
+        assert value.shape == expected.shape
+        assert torch.allclose(value, expected, atol=1e-5)

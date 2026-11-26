@@ -16,6 +16,13 @@ the next step overwrites: clone what you keep. And the callable's return is
 discarded, so an edit has to land *in place*; in-place edits already do, and a
 replacement swap is copied back into the live tensor, shape-checked.
 
+A tap on a module's kernel sites, ``{path}.kernel``, is served by the kernel
+shim (intervention/kernel.py), which vLLM's own eager break around the attention
+op already runs on every replay. The shim attributes a kernel call to the module
+whose forward is running, and a replayed step runs no forward. So while the
+graph is recorded, two more callables go in around that module's body: one that
+marks the module as running and one that unmarks it.
+
 Taps are the only locations a replayed step reaches. Every other module's
 handoff lives in its forward, which a replayed graph never runs; a block parked
 on one is told so when its request ends (see ``Requests.finish_dangling``).
@@ -27,6 +34,7 @@ from typing import Any, Iterable
 
 import torch
 
+from ...intervention import kernel
 from ...intervention.interleaver import Interleaver
 from ...util import apply
 
@@ -83,6 +91,14 @@ class VLLMInterleaver(Interleaver):
     def __init__(self, taps: Iterable[str] = (), **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.taps = frozenset(taps)
+        # A module's controller hands off ``{path}.skip`` just before its body and
+        # ``{path}.output`` just after (`Controller.__call__`), which is where the
+        # callables around a kernel tap's body are recorded.
+        paths = [tap[: -len(kernel.SUFFIX)] for tap in self.taps if tap.endswith(kernel.SUFFIX)]
+        self._before = {f"{path}.skip": path for path in paths}
+        self._after = frozenset(f"{path}.output" for path in paths)
+        #: Frames of modules marked as running by a replayed step.
+        self._running: list = []
 
     def instrument(self, envoy: Any) -> None:
         """Route the module through this interleaver, and open its forward if a tap reaches inside.
@@ -108,7 +124,33 @@ class VLLMInterleaver(Interleaver):
                 f"{missing[0]!r}. Its operations are {list(source.names)}."
             )
 
+    def _enter(self, path: str) -> None:
+        """Mark the module at ``path`` as running, on a replayed step."""
+        # A kernel that raised on an earlier step left its module marked.
+        self._leave()
+        self._running.append(kernel.push(self, path))
+
+    def _leave(self, output: str | None = None) -> None:
+        """Unmark the running module, and count the visit its kernel sites are scheduled by.
+
+        A request for a kernel site at step ``n`` is matched against the count of
+        the module's ``.output`` visits. A tapped ``.output`` is counted when it
+        is served; one that is not a tap is never handed off, so it is counted here.
+        """
+        while self._running:
+            kernel.pop(self._running.pop())
+        if output is not None and output not in self.taps and self.interleaving:
+            self.counts[output] = self.counts.get(output, 0) + 1
+
     def handle(self, provider: str, value: Any) -> Any:
+        path = self._before.get(provider)
+        if path is not None or provider in self._after:
+            capture = _capture()
+            if capture is not None:
+                capture.add_eager((lambda: self._leave(provider)) if path is None else (lambda: self._enter(path)))
+            elif path is None:
+                # A step too long for any graph runs the module's forward itself.
+                self._leave(provider)
         # While vLLM is recording a graph, a tap's handoff is not served now but
         # registered to be replayed at this point of every later step. The runner
         # enters the interleaver around that recording so the handoff reaches here.

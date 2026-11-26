@@ -266,8 +266,9 @@ kernel, the location never fires and the trace ends with `OutOfOrderError:
 - An MoE layer running under `experts_implementation="eager"` (or `deepgemm`,
   `sonicmoe`, FP8, or `kernels`).
 - A vLLM model's state-space and MoE layers, and its attention on any backend
-  other than FlashAttention or under `taps`. vLLM's FlashAttention sites are
-  described in [models/vllm.md](../models/vllm.md#attention-kernel-sites).
+  other than FlashAttention. vLLM's FlashAttention sites, including on an engine
+  built with `taps`, are described in
+  [models/vllm.md](../models/vllm.md#attention-kernel-sites).
 
 ## Recurrent states of a chunked kernel
 

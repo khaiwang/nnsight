@@ -457,7 +457,7 @@ class Requests:
             # A barrier unwinds with a ValueError and names no module location.
             and isinstance(error, OutOfOrderError)
             and requester.provider not in taps
-            and requester.provider.rsplit(".", 1)[-1] in ("input", "output", "skip")
+            and requester.provider.rsplit(".", 1)[-1] in ("input", "output", "skip", "kernel")
         ):
             # Outside the taps nothing is reached however many steps ran, so the
             # loop's shape is beside the point: this is the whole reason.

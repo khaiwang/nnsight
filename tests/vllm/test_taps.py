@@ -102,6 +102,13 @@ def test_untapped_location_is_named(vllm_gpt2_taps, ET_prompt):
             vllm_gpt2_taps.transformer.h[8].mlp.output.save()
 
 
+@torch.no_grad()
+def test_untapped_kernel_site_is_named(vllm_gpt2_taps, ET_prompt):
+    with pytest.raises(RuntimeError, match="is not a tap on this engine"):
+        with vllm_gpt2_taps.trace(ET_prompt, temperature=0.0, top_p=1):
+            vllm_gpt2_taps.transformer.h[0].attn.attn.kernel.probs().save()
+
+
 def test_a_wrong_shaped_swap_errors_its_request_only(vllm_gpt2_taps, ET_prompt):
     # The batcher's widen refuses a replacement that does not fit the rows, inside
     # the worker's handoff, so the error is this request's; the engine — which
