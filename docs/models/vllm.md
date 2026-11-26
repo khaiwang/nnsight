@@ -542,6 +542,19 @@ entry because the layer outputs feeding them already differ between a graph
 replay and eager execution (layer 0's output differs by 2e-3 with identical
 kernel inputs and outputs; cause not determined).
 
+The Kimi delta attention layer of Kimi Linear (`model.layers[i].self_attn` on
+its delta attention layers) and the gated delta rule layer of OLMo hybrid
+(`model.layers[i].linear_attn`) serve the same two sites. Both layers run every
+request of a step that prefills through their chunk kernel. On a tiny random
+Kimi Linear, every token's state of a 145-token prompt is within 0.7% of the
+transformers sites in fp32. vLLM 0.33 cannot load an OLMo hybrid checkpoint:
+loading `allenai`-named weights raises `TypeError: list indices must be
+integers or slices, not NoneType` in the layer's conv weight loader, which
+never receives the shard id. With that loader patched in a scratch run, a tiny
+random OLMo hybrid was within 1.4% of the transformers sites at all 183
+tokens; no test is committed for it. Neither layer was run under tensor
+parallelism or `taps`.
+
 Served on the Triton/FLA prefill kernel, which vLLM selects on GPUs before
 Hopper, and on the one-token decode kernels. Not served: a prefill on the
 FlashInfer kernel (vLLM's choice on Hopper), which returns no chunk states;

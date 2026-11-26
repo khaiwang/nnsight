@@ -90,3 +90,55 @@ def test_decode_steps_continue_each_request(engine):
         for previous, (chunks, states) in zip(steps, steps[1:]):
             assert torch.equal(chunks[0], previous[0][-1])
             assert torch.equal(states[0], chunks[1])
+
+
+# ---------------------------------------------------------------------------
+# Kimi delta attention (a tiny random Kimi Linear): a per-key-channel decay
+# ---------------------------------------------------------------------------
+
+KIMI = "yujiepan/kimi-linear-tiny-random"
+
+
+def test_kimi_states_match_hf():
+    """Every token's state of the first delta attention layer, on a step that prefills two requests."""
+    import json
+    from pathlib import Path
+
+    from huggingface_hub import snapshot_download
+
+    from nnsight import TransformersModel
+    from nnsight.modeling.vllm import VLLM
+
+    # The tokenizer's code lives in the released model's repository.
+    engine = VLLM(KIMI, gpu_memory_utilization=0.15, dispatch=True, trust_remote_code=True, max_model_len=1024)
+    kernel = engine.model.layers[0].self_attn.kernel
+    with engine.trace(temperature=0.0, max_tokens=2) as tracer:
+        with tracer.invoke(SHORT):
+            other = kernel.chunk_states().shape.save()
+        with tracer.invoke(PROMPT):
+            steps = list().save()
+            for _ in tracer.iter[:2]:
+                steps.append((kernel.chunk_states().clone(), kernel.states().clone()))
+
+    # transformers' own Kimi Linear class wants every layer listed; the checkpoint leaves its last one out.
+    # vLLM registers a config class of its own for this model type, so transformers' classes are named here.
+    import transformers
+
+    config = json.loads((Path(snapshot_download(KIMI)) / "config.json").read_text())
+    config["linear_attn_config"]["full_attn_layers"].append(config["num_hidden_layers"])
+    config = transformers.KimiLinearConfig.from_dict(config)
+    module = transformers.KimiLinearForCausalLM.from_pretrained(KIMI, config=config, dtype=torch.float32)
+    reference = TransformersModel(module, task="text-generation", tokenizer=engine.tokenizer, device="cuda")
+    with reference.trace(PROMPT):
+        expected = reference.model.layers[0].self_attn.kernel.states().save()
+    expected = expected[0].float().cpu()
+
+    chunks, states = steps[0]
+    count = expected.shape[0]
+    assert tuple(other) == (2, *expected.shape[1:])
+    assert states.shape == expected.shape and chunks.shape[0] == -(-count // 64) + 1
+    scale = expected.abs().amax((1, 2, 3))
+    assert float(((states.float().cpu() - expected).abs().amax((1, 2, 3)) / scale).max()) < 3e-2
+    # The decode step starts from the state the prefill left in the cache.
+    assert _relative(steps[1][0][0], chunks[-1].float().cpu()) < 1e-3
+    assert tuple(steps[1][1].shape) == (1, *expected.shape[1:])

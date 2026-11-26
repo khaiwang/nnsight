@@ -123,7 +123,9 @@ runtime's code or nnsight's docs and not run.
 | gated delta rule, Kimi delta attention, Mamba (transformers) | chunks or tokens, heads after a batch dimension | all `WHOLE`: transformers gathers the projections before the kernel (from `docs/usage/kernel.md`) | not applicable | declared; needs no collective |
 | gated delta rule layer of Qwen3-Next and Qwen3.5, `gdn_attn` (vLLM) | chunks or tokens, heads | `heads` split (each rank holds `num_v_heads // tp_size` value heads and their states) | not applicable | declared; measured on Qwen3.5-0.8B on A100s against the transformers sites, on eager, tapped and two-rank engines. Triton/FLA prefill kernel and the one-token decode kernels. The FlashInfer prefill kernel (Hopper) exports checkpoints at a set interval, not read yet |
 | Mamba2 layer, `mamba2_attn` (vLLM) | chunks or tokens, heads | `heads` split | not applicable | declared; measured on mamba2-130m on A100s against the transformers sites, on one rank and two tensor-parallel ranks. Chunks follow vLLM's cut of the prefill strip. ReplaySSM decode not served |
-| Kimi and OLMo gated delta rule layers, `linear_attn`, `mamba1_attn` (vLLM) | not surveyed | not surveyed | not surveyed | not started; vLLM keeps each request's state in a slot of the layer's state cache |
+| Kimi delta attention and OLMo hybrid gated delta rule layers (vLLM) | chunks or tokens, heads | `heads` split | not applicable | declared; Kimi measured on a tiny random Kimi Linear against the transformers sites on one rank; OLMo measured once in a scratch run with vLLM 0.33's conv weight loader patched, since that version cannot load the model. Not run at 2 ranks or with `taps` |
+| Mamba1 layer, `mamba1_attn` (vLLM) | chunks or tokens, heads (channels) | `heads` split | not applicable | declared; measured on mamba-130m against the transformers sites on one rank. A request is one chunk, since the fused scan writes only the final state. Not run at 2 ranks or with `taps` |
+| `linear_attn` (MiniMax), `short_conv_attn` (vLLM) | not surveyed | not surveyed | not surveyed | not started |
 | `grouped_mm` and `batched_mm` experts forwards (transformers) | tokens, slot | intermediate dimension split and the down projection a partial sum (from the docstring in `modeling/kernels/experts.py`) | each rank holds the (token, expert) pairs routed to its experts, other pairs as sentinels | not served; needs two layouts the contract does not have yet |
 | fused MoE, Triton experts kernel (vLLM) | tokens, slot or expert | `width` of the activation rows split; the down projection is a partial sum, added over ranks | `slot` and `expert` routed: each rank holds the rows of its own experts | declared; measured on DeepSeek-V2-Lite on A100s, on one rank against the layer's weights, and on two expert-parallel and two tensor-parallel ranks against one rank. `expert_output` is recomputed because the kernel applies the routing weight in the same pass |
 
@@ -141,8 +143,9 @@ Not surveyed. Served today: gated delta rule, Kimi delta attention, Mamba2 and
 Mamba1 through transformers' hub-kernel wrappers (Python reference, with or
 without the `kernels` package installed), and the `fla` gated delta rule
 kernels. vLLM registers `gdn_attn`, `linear_attn`, `short_conv_attn`,
-`mamba1_attn` and `mamba2_attn` backends; the Qwen gated delta rule layer of
-`gdn_attn` is served, the others are not.
+`mamba1_attn` and `mamba2_attn` backends; the Qwen, OLMo and Kimi layers of
+`gdn_attn` and the Mamba1 and Mamba2 layers are served, `linear_attn` and
+`short_conv_attn` are not.
 
 ## Mixture of experts
 
