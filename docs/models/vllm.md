@@ -455,6 +455,40 @@ callables around the layer. A kernel site that is not a tap raises the same
 
 The sites are not served on other attention backends (Triton, FlashInfer, MLA).
 
+## MLA attention kernel sites
+
+On a model with multi-head latent attention (DeepSeek-V2 and related), the
+inner attention module carries the same three sites, with the same
+`[query, heads, key]` layout and no batch axis:
+
+```python
+attn = model.model.layers[3].self_attn.mla_attn.mla_attn     # DeepSeek-V2-Lite
+with model.trace(prompt, max_tokens=3, temperature=0.0) as tracer:
+    steps = list().save()
+    for _ in tracer.iter[:3]:
+        steps.append(attn.kernel.probs(query=-1).clone())    # [heads, keys so far]
+```
+
+An MLA layer runs a step's tokens through two kernels, and the sites follow the
+one a request went through:
+
+| Step | Kernel | `scores` | `lse` | `probs` |
+|------|--------|----------|-------|---------|
+| Prefill | FlashAttention over the new tokens' expanded keys | `q . k * scale` in fp32 | the kernel's, fp32, requested in the same launch | `exp(scores - lse)` (exact reconstruction) |
+| Decode | Triton decode kernel over the request's compressed rows in the paged cache | `q . k * scale` in fp32, with the query projected into the compressed space as the kernel receives it | the kernel's, in the query dtype | fp32 softmax of the scores (`replay`), because a bf16 logsumexp is too coarse to divide by |
+
+On DeepSeek-V2-Lite the probabilities of layers 0 and 3 equal transformers'
+eager attention to within 0.07 at prefill and 0.03 at two decode steps, with
+both in bf16; against an fp32 transformers run the gap is 0.035 and 0.011.
+The sampled tokens are identical. Under `tensor_parallel_size=2` the sites
+assemble the ranks' heads and equal the one-rank engine to within 0.05 (the
+test's bound).
+
+Not served: a prefill that continues cached or earlier-chunk context (prefix
+caching or chunked prefill), which vLLM computes as several kernel calls merged
+by logsumexp; the other MLA backends (FlashMLA, FlashInfer, CUTLASS, sparse
+variants); and a quantized cache.
+
 ## Recurrent kernel sites
 
 On Qwen3-Next and Qwen3.5 models, a gated delta rule layer

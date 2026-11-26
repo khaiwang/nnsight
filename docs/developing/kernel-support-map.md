@@ -100,7 +100,7 @@ as DeepSeek V3.
 
 | Entry point | Reached from | Status |
 |---|---|---|
-| vLLM `v1/attention/backends/mla/` | vLLM | not started |
+| vLLM `v1/attention/backends/mla/` | vLLM | Triton MLA decode with the FlashAttention prefill kernel served (`modeling/vllm/mla.py`); FlashMLA, FlashInfer, CUTLASS, TRTLLM, TokenSpeed and the sparse variants not started |
 | SGLang's MLA backends | SGLang | not started |
 
 Not placed yet: `flex_attention` (both transformers and vLLM register it), and
@@ -118,7 +118,7 @@ runtime's code or nnsight's docs and not run.
 |---|---|---|---|---|
 | `flash_attn_varlen_func`, FlashAttention 2 (vLLM) | query, heads, key | heads `SPLIT`; query, key `WHOLE` | same ranks, same layout | declared; measured on Qwen2.5-0.5B at 2 ranks |
 | FlashAttention 3 and 4, FlashInfer, Triton (vLLM) | query, heads, key | heads `SPLIT`: vLLM shards the query projection by head before any attention backend runs (from source) | same | not started; needs the reader for each backend first |
-| MLA backends (vLLM) | not surveyed | not surveyed | not surveyed | not started |
+| MLA, Triton decode with FlashAttention prefill (vLLM) | query, heads, key | `heads` split | not applicable | declared; measured on DeepSeek-V2-Lite on A100s against transformers' eager attention, on one rank and two tensor-parallel ranks. A prefill continuing cached context is refused |
 | `scaled_dot_product_attention`, eager, FlashAttention 2 (transformers) | heads, query, key after a batch dimension | heads `SPLIT`; query, key `WHOLE` | not applicable | declared; measured on the CPU suite (`tests/tp/test_cpu_gloo.py`, tiny random Llama at 2 ranks). The rank group is set only when the plan column-shards a projection inside the attention module |
 | gated delta rule, Kimi delta attention, Mamba (transformers) | chunks or tokens, heads after a batch dimension | all `WHOLE`: transformers gathers the projections before the kernel (from `docs/usage/kernel.md`) | not applicable | declared; needs no collective |
 | gated delta rule layer of Qwen3-Next and Qwen3.5, `gdn_attn` (vLLM) | chunks or tokens, heads | `heads` split (each rank holds `num_v_heads // tp_size` value heads and their states) | not applicable | declared; measured on Qwen3.5-0.8B on A100s against the transformers sites, on eager, tapped and two-rank engines. Triton/FLA prefill kernel and the one-token decode kernels. The FlashInfer prefill kernel (Hopper) exports checkpoints at a set interval, not read yet |
