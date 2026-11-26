@@ -27,9 +27,14 @@ serve ``[heads, K, V]``, the layout of the transformers sites.
   On a decode step, the state before the token and the state after it.
 * ``states``: ``[tokens, heads, K, V]``, the state after each token of the step.
 
+Under tensor parallelism each rank's layer holds ``num_v_heads // tp_size``
+value heads, in rank order, and a state of that many heads. The reader declares
+``heads`` as `SPLIT`, so `Sites.read` assembles the ranks' blocks and ``heads=``
+indexes the model's heads.
+
 Not served: a prefill on another backend (FlashInfer, CuteDSL, AITER, SYCL),
-whose kernels keep the chunk states to themselves; speculative decoding; and
-tensor parallelism, where the layout of the heads across ranks is not surveyed.
+whose kernels keep the chunk states to themselves, and speculative decoding,
+whose draft tokens advance a state the layer later discards.
 """
 
 from __future__ import annotations
@@ -41,7 +46,7 @@ import torch
 
 from ...intervention import sites
 from ...intervention.kernel import Attr, Located, Spec, unshimmed
-from ...intervention.sites import Batch, Provenance, Sites, Unavailable
+from ...intervention.sites import SPLIT, Batch, Provenance, Sites, Unavailable
 from ..kernels.recurrent import Recurrence, _gated_delta_step, _walk, recurrence
 
 NAME = "QwenGatedDeltaNetAttention._forward_core"
@@ -120,8 +125,6 @@ def serve(fn: Callable, args: tuple, kwargs: dict) -> tuple[Any, Sites]:
     """Run ``_forward_core`` with its kernels recording, and hand back a `Scan` over what they did."""
     from vllm.forward_context import get_forward_context
 
-    from .fragments import _tp_world_size
-
     _install()
     outer, _capture.calls = _capture.calls, (calls := [])
     try:
@@ -133,11 +136,9 @@ def serve(fn: Callable, args: tuple, kwargs: dict) -> tuple[Any, Sites]:
     metadata = metadata.get(layer.prefix) if isinstance(metadata, dict) else None
     if metadata is None:
         return output, Unavailable(f"{NAME} ran without attention metadata; its kernel sites are not served on this call")
-    if _tp_world_size() > 1:
-        return output, Unavailable(f"{NAME}: kernel sites are not served under tensor parallelism")
     if metadata.spec_sequence_masks is not None:
         return output, Unavailable(f"{NAME}: kernel sites are not served under speculative decoding")
-    return output, Scan(calls, metadata)
+    return output, Scan(calls, metadata, layer.num_v_heads // layer.tp_size)
 
 
 class Scan(Sites):
@@ -145,10 +146,15 @@ class Scan(Sites):
 
     names = Recurrence.names
     axes = Recurrence.axes
+    #: Each rank's layer holds one block of the value heads, and so does its state.
+    layout = {"tp": {"heads": SPLIT}}
     narrowed = True
 
-    def __init__(self, calls: list[dict[str, Any]], metadata: Any) -> None:
+    def __init__(self, calls: list[dict[str, Any]], metadata: Any, heads: int) -> None:
         self.calls = calls
+        #: Value heads this rank's layer holds.
+        self.heads = heads
+        self.batch: Batch | None = None
         #: First token row of each request in the step's flat buffer, and one past the last request.
         self.starts: list[int] = metadata.non_spec_query_start_loc.tolist()
         count = len(self.starts) - 1
@@ -197,12 +203,22 @@ class Scan(Sites):
             "kernel sites cover the Triton/FLA prefill kernel and the one-token decode kernels"
         )
 
+    def local(self, axis: str) -> int:
+        return self.heads
+
     def read(self, site: str, spec: dict[str, Any], batch: Batch | None) -> tuple[torch.Tensor, Provenance]:
-        if site not in self.names:
-            raise ValueError(f"this kernel has no site {site!r}; available: {', '.join(self.names)}")
-        sites.check_axes(spec, site, self.axes[site])
-        value, provenance = self._reader(self.slots[self._request(batch)]).read(site, spec, None)
+        self.batch = batch
+        return super().read(site, spec, batch)
+
+    def _site(self, site: str, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
+        value, provenance = self._reader(self.slots[self._request(self.batch)]).read(site, spec, None)
         return value.squeeze(0), provenance
+
+    def chunk_states(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
+        return self._site("chunk_states", spec)
+
+    def states(self, spec: dict[str, Any]) -> tuple[torch.Tensor, Provenance]:
+        return self._site("states", spec)
 
 
 def forward_core(context: None) -> Located:

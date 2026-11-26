@@ -490,11 +490,24 @@ Each request's state lives in a slot of the layer's state cache, and a decode
 step advances the slot in place. The state a decode step serves as entering is
 therefore the state the previous step served as final, bit for bit.
 
+Under tensor parallelism each rank's layer holds `num_v_heads // tp_size`
+value heads and a state of that many heads. The sites assemble the ranks'
+blocks, so `heads=` indexes the model's heads. On Qwen3.5-0.8B at
+`tensor_parallel_size=2`, layer 0 equals the one-rank engine exactly on a
+prefill step and to 3e-5 on a later decode step.
+
+On an engine built with `taps`, name the site as
+`"language_model.model.layers.*.linear_attn.kernel"`. Layer 0 then equals the
+eager engine exactly. Deeper layers differ by a few percent of the largest
+entry because the layer outputs feeding them already differ between a graph
+replay and eager execution (layer 0's output differs by 2e-3 with identical
+kernel inputs and outputs; cause not determined).
+
 Served on the Triton/FLA prefill kernel, which vLLM selects on GPUs before
 Hopper, and on the one-token decode kernels. Not served: a prefill on the
 FlashInfer kernel (vLLM's choice on Hopper), which returns no chunk states;
-speculative decoding; tensor parallelism; and the Kimi and OLMo gated delta
-rule layers.
+speculative decoding, where draft tokens advance states that are later
+discarded; and the Kimi and OLMo gated delta rule layers.
 
 ## CUDA graphs with taps
 

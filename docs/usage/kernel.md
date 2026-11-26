@@ -551,7 +551,7 @@ What each served reader declares:
 | vLLM paged FlashAttention (`modeling/vllm/kernel.py`) | `lse` [query, heads]; `scores`, `probs` [query, heads, key] | 0 | heads `SPLIT`; query and key `WHOLE` |
 | `scaled_dot_product_attention`, eager and FlashAttention 2 in transformers (`intervention/attention.py`) | `lse` [heads, query]; `scores`, `probs` [heads, query, key] | 1 | heads `SPLIT`; query and key `WHOLE` |
 | Recurrent scans in transformers (`modeling/kernels/recurrent.py`) | `chunk_states` [chunks, heads]; `states` [tokens, heads] | 1 | all `WHOLE` |
-| vLLM gated delta rule layer (`modeling/vllm/recurrent.py`) | `chunk_states` [chunks, heads]; `states` [tokens, heads] | 0 | not served |
+| vLLM gated delta rule layer (`modeling/vllm/recurrent.py`) | `chunk_states` [chunks, heads]; `states` [tokens, heads] | 0 | `tp`: `heads` `SPLIT` |
 | Experts forwards in transformers (`modeling/kernels/experts.py`) | per-pair rows [tokens, slot], with `expert=` selecting in place of `slot` | none | not served |
 
 The layouts still to add, and the kernels that need them, are listed in the
