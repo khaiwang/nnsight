@@ -265,8 +265,8 @@ kernel, the location never fires and the trace ends with `OutOfOrderError:
   CodeGen, GPT-J, DeBERTa).
 - An MoE layer running under `experts_implementation="eager"` (or `deepgemm`,
   `sonicmoe`, FP8, or `kernels`).
-- A vLLM model's Mamba layers, and its attention on any backend other than
-  FlashAttention. vLLM's FlashAttention sites, including on an engine built
+- A vLLM model's Mamba1 layers, and its attention on any backend other than
+  FlashAttention and Triton MLA. vLLM's FlashAttention sites, including on an engine built
   with `taps`, its gated delta rule sites and its expert sites are described in
   [models/vllm.md](../models/vllm.md#attention-kernel-sites).
 
@@ -554,6 +554,7 @@ What each served reader declares:
 | Recurrent scans in transformers (`modeling/kernels/recurrent.py`) | `chunk_states` [chunks, heads]; `states` [tokens, heads] | 1 | all `WHOLE` |
 | vLLM MLA attention, FlashAttention prefill and Triton decode (`modeling/vllm/mla.py`) | `lse` [query, heads]; `scores`, `probs` [query, heads, key] | 0 | heads `SPLIT`; query and key `WHOLE` |
 | vLLM gated delta rule layer (`modeling/vllm/recurrent.py`) | `chunk_states` [chunks, heads]; `states` [tokens, heads] | 0 | `tp`: `heads` `SPLIT` |
+| vLLM Mamba2 layer (`modeling/vllm/mamba.py`) | `chunk_states` [chunks, heads]; `states` [tokens, heads] | 0 | `tp`: `heads` `SPLIT` |
 | vLLM Triton experts kernel (`modeling/vllm/experts.py`) | `expert_input`, `expert_activation`, `expert_output` [tokens, slot or expert] | 0 | expert parallelism: `slot` and `expert` `ROUTED`; tensor parallelism alone: `width` of `expert_activation` `SPLIT`, `expert_output` summed over ranks |
 | Experts forwards in transformers (`modeling/kernels/experts.py`) | per-pair rows [tokens, slot], with `expert=` selecting in place of `slot` | none | not served |
 

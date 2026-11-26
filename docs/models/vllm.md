@@ -544,6 +544,40 @@ speculative decoding, where draft tokens advance states that are later
 discarded; and the Kimi and OLMo gated delta rule layers.
 
 
+## Mamba2 kernel sites
+
+A Mamba2 layer (`MambaMixer2`: Mamba2, and the state-space layers of
+Nemotron-H, Jamba, Granite hybrid, Falcon-H1 and Zamba2) carries the same two
+recurrent sites:
+
+```python
+mixer = model.backbone.layers[0].mixer                        # mamba2-130m
+with model.trace(prompt, max_tokens=1, temperature=0.0):
+    chunks = mixer.kernel.chunk_states().clone().save()       # [chunks + 1, heads, head_dim, state]
+    states = mixer.kernel.states(tokens=[0, 100, -1]).clone().save()
+```
+
+| Site | Shape | Value |
+|------|-------|-------|
+| `chunk_states` | `[chunks + 1, heads, head_dim, state]` | On a prefill step: the state entering each chunk the kernel cut for this request, then its final state. On a decode step: the state before the token and the state after it. |
+| `states` | `[tokens, heads, head_dim, state]` | The state after each token of the step. A token that ends a chunk is the kernel's own state; one inside a chunk is advanced from the chunk's entering state in fp32 with the layer's recurrence. |
+
+vLLM packs a step's prefilling requests into one strip and cuts chunks at every
+multiple of the model's chunk size along the strip and at every request
+boundary. A request that is not first in the strip therefore has a shorter
+first chunk, and which request is first is vLLM's choice. `chunk_states`
+follows that cut; `states` does not depend on it.
+
+The state layout is the transformers layout, so no axes are swapped. On
+mamba2-130m, the states after 8 tokens of a 391-token prompt equal the
+transformers sites to 0.3% of the largest entry at layer 0 and 2.5% at layer 5,
+with vLLM in bf16 and transformers in fp32. Under `tensor_parallel_size=2` the
+sites assemble the ranks' heads and equal the one-rank engine to within 2%
+(the test's bound).
+
+Not served: the ReplaySSM decode path and speculative decoding. Not tested: an
+engine built with `taps`.
+
 ## Expert kernel sites
 
 On a model whose MoE layers run vLLM's Triton experts kernel, the MoE module

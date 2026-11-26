@@ -202,7 +202,8 @@ CATALOG: list[Spec] = [
 def register_kernels() -> None:
     """Register `CATALOG`; called in the worker process, which is where the kernel runs."""
     from .experts import CATALOG as EXPERTS
+    from .mamba import CATALOG as MAMBA
     from .mla import CATALOG as MLA
     from .recurrent import CATALOG as RECURRENT
 
-    register_catalog([*CATALOG, *RECURRENT, *EXPERTS, *MLA])
+    register_catalog([*CATALOG, *RECURRENT, *EXPERTS, *MLA, *MAMBA])
