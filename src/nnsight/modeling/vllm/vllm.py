@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import keyword
 import os
 import re
 from collections.abc import Iterable, Mapping
@@ -797,11 +798,89 @@ class VLLM(Remotable):
         A separate method rather than a `clear_edits` that returns something
         awaitable on an async engine: a coroutine nobody awaits never runs at
         all, so the sync-looking call would leave every edit installed and say
-        nothing. That is the failure `Registration._rpc` refuses, and it is worth
+        nothing. That is the failure `registration.rpc` refuses, and it is worth
         refusing here too — `clear`/`aclear` already come in this pair.
         """
         for edit in list(self._installed_edits):
             await edit.aclear()
+
+    def attach(self, name: str, module: torch.nn.Module, rows: str | None = None) -> Any:
+        """Add a module of your own to the engine's model, as ``model.<name>``.
+
+        A module referenced from a block (a probe, an SAE) is copied into
+        every request, so no two requests hold the same one and none of its
+        calls can be shared. An attached module is sent to the engine once,
+        with its weights, and is held in the model's tree on every worker; a
+        block calls it as it calls any module of the model::
+
+            >>> model.attach("probe", torch.nn.Linear(4096, 2))       # doctest: +SKIP
+            >>> with model.trace(prompt):                             # doctest: +SKIP
+            ...     out = model.model.layers[20].output
+            ...     score = model.probe((out[0] + out[1])[-1:].float()).save()
+
+        Synchronous-engine only, like `edit`'s plain ``with``; use `aattach` on
+        an async engine. An nnsight-serve engine cannot be attached to yet.
+
+        Args:
+            name: The attribute it is reached by. Must be free on the model.
+            module: The module. Each worker moves it to its device; its dtype
+                is left as it is.
+            rows: How its calls treat rows, for sharing one call between the
+                requests of an engine step (see
+                [`Coalescer.register`][nnsight.intervention.coalesce.Coalescer.register]).
+                ``None``: nothing is stated. Its calls and its children's are
+                shared only when the module's class is one the engine shares
+                (``nn.Linear``, ``nn.LayerNorm``, ...), as the model's are.
+                ``"token"``: every call of it computes each output row from its
+                own input row, and is shared. ``"span"``: it reduces over each
+                request's own rows; a block calls ``module(rows)`` and it is
+                run as ``module(rows, sizes=[n_1, ..., n_K])``, returning one
+                item per request.
+
+        Returns:
+            The module's envoy, ``model.<name>``.
+        """
+        from .registration import rpc
+
+        payload = self._attachable(name, module, rows)
+        rpc(self, "nnsight_attach", name, payload, rows)
+        return self._add_envoy(name, module)
+
+    async def aattach(self, name: str, module: torch.nn.Module, rows: str | None = None) -> Any:
+        """`attach`, awaited: the async engine's form."""
+        from .registration import arpc
+
+        payload = self._attachable(name, module, rows)
+        await arpc(self, "nnsight_attach", name, payload, rows)
+        return self._add_envoy(name, module)
+
+    def _attachable(self, name: str, module: torch.nn.Module, rows: str | None) -> bytes:
+        """Check an `attach` call and serialize its module for the workers."""
+        if rows not in (None, "token", "span"):
+            raise ValueError(f"rows must be None, 'token' or 'span', got {rows!r}")
+        if not isinstance(module, torch.nn.Module):
+            raise TypeError(f"attach takes a torch.nn.Module, got {type(module).__name__}")
+        if not self.dispatched:
+            self.dispatch()
+        # Looked up on the class and the wrapped module: `hasattr(self, name)`
+        # would run an envoy property such as `output`.
+        taken = hasattr(type(self), name) or name in self.__dict__ or hasattr(self._module, name)
+        if not name.isidentifier() or keyword.iskeyword(name) or name.startswith("_") or taken:
+            raise ValueError(
+                f"cannot attach a module as {name!r}: the name has to be an "
+                "identifier the model does not already use."
+            )
+        for part in module.modules():
+            if id(part) in self.interleaver.envoys:
+                raise ValueError(
+                    f"cannot attach a module as {name!r}: it is, or holds, a module "
+                    "already in this model's tree. Attach a module of its own, and "
+                    "call the model's modules from the block."
+                )
+            # The id an envoy tree left on a module it serialized would send the
+            # module as a reference to that tree's path, without its weights.
+            part.__dict__.pop("_persistent_id", None)
+        return dumps(module)
 
     def generate(self, *inputs: Any, **kwargs: Any) -> Any:
         """Generate — as a trace when used as a ``with`` block, plainly when not.

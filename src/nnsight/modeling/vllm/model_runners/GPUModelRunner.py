@@ -42,7 +42,7 @@ from ....intervention.serialization import loads
 from ....tracing.tracer import _local, inc
 from ..batching import VLLMBatcher
 from ....intervention.coalesce import Coalescer
-from ..coalesce import coalesce_enabled, tokenwise
+from ..coalesce import COALESCE, coalesce_enabled, tokenwise
 from ..collect import dumps_compact
 from ..fragments import VLLMFragments
 from ..interleaver import VLLMInterleaver
@@ -539,8 +539,9 @@ class NNsightGPUModelRunner(GPUModelRunner):
 
         self.nnsight_requests = Requests()
         # The map that resolves a serialized request's persistent ids (the interleaver,
-        # every module, the tokenizer) back to this worker's objects. The tree is fixed
-        # after load, so build it once here rather than walk it every step in `add`.
+        # every module, the tokenizer) back to this worker's objects. The tree changes
+        # only in `nnsight_attach`, so build it once here rather than walk it every
+        # step in `add`.
         self.nnsight_persistent_objects = (
             self.nnsight_model._remoteable_persistent_objects()
         )
@@ -814,6 +815,27 @@ class NNsightGPUModelRunner(GPUModelRunner):
         self.nnsight_requests.register(
             registration_id, payload, self.nnsight_persistent_objects, name=name
         )
+
+    def nnsight_attach(self, name: str, payload: bytes, rows: str | None) -> None:
+        """Add a module to the model's tree as ``model.<name>`` (`VLLM.attach`).
+
+        Runs on all ranks, so every rank holds the module and registers it
+        alike, and the ranks share the same calls of it.
+        """
+        module = loads(payload, persistent_objects=self.nnsight_persistent_objects)
+        coalescer = self.nnsight_model.interleaver.coalescer
+        if rows == "span" and coalescer is None:
+            raise ValueError(
+                "a module attached with rows='span' is called through the coalescer, "
+                f"and this engine was built with {COALESCE} off."
+            )
+        attached = self.nnsight_model._add_envoy(name, module.to(self.device))
+        # A block refers to a module by its path; requests from now on can
+        # name the new ones.
+        for envoy in attached.modules():
+            self.nnsight_persistent_objects[f"Module:{envoy.path}"] = envoy._module
+        if rows is not None and coalescer is not None:
+            coalescer.register(module, rows)
 
     def nnsight_clear_registered(self, registration_id: str) -> None:
         """Stop running a block and drop what it has not handed back."""

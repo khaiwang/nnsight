@@ -143,8 +143,66 @@ tensor, a module, nor a plain value.
 - Do not call attention or a whole decoder layer from a block. They read the engine's state
   for the whole step, and with several requests in the step the call ends the engine with a
   CUDA illegal memory access. This is the same with coalescing off.
-- A module you bring with the block (a probe, an SAE) is a plain module, not part of the
-  model's tree, so its calls are never parked or shared. Give it every row you have in one call.
+- A module you bring with the block (a probe, an SAE) is copied into every request, so its
+  calls are never shared. Attach it to the engine instead (next section).
+
+### Attaching a module of your own
+
+`model.attach(name, module, rows=None)` sends a module to the engine once, with its weights,
+and adds it to the model's tree on every worker as `model.<name>`. A block then calls it like
+any module of the model, and the requests of an engine step can share the call:
+
+```python
+# MyDictionary and MeanProbe are modules of yours; MeanProbe is written out below.
+model.attach("features", MyDictionary(4096), rows="token")
+model.attach("harm_probe", MeanProbe(4096), rows="span")
+
+with model.trace(temperature=0.0, max_tokens=1) as tracer:
+    for prompt in prompts:
+        with tracer.invoke(prompt):
+            out = model.model.layers[20].output
+            stream = (out[0] + out[1]).clone()             # [tokens, hidden], this request's
+            active = model.features(stream).save()         # [tokens, features]
+            score = model.harm_probe(stream).save()        # [2]
+```
+
+`rows` states how the module treats rows. nnsight takes it as given and checks nothing, so a
+module that lets one request's rows into another's result leaks between requests.
+
+| `rows` | The module | How it is called |
+|---|---|---|
+| `None` | anything | Nothing is stated. Its calls and its children's are shared only when the module's class is in the table above, as the model's are: `model.probe.projection(x)` is shared when `projection` is an `nn.Linear`, and a module of a class of your own runs for each request alone. |
+| `"token"` | computes each output row from its own input row, and leaves its arguments unchanged | One call on every request's rows; each request gets its rows of the result. |
+| `"span"` | reduces over each request's own rows: pooling over a prompt's tokens, distances between them | A block calls `module(rows)`, with `rows` the first positional argument and the only tensor. It is run as `module(rows, sizes=[n_1, ..., n_K])` on the K requests' rows concatenated and returns a tensor or a list K long; request `i` gets item `i`. A request alone is `K = 1`. |
+
+A span module is written for the batch:
+
+```python
+class MeanProbe(torch.nn.Module):
+    def __init__(self, width):
+        super().__init__()
+        self.readout = torch.nn.Linear(width, 2)
+
+    def forward(self, rows, sizes):                        # rows: [n_1 + ... + n_K, width]
+        means = torch.stack([span.float().mean(0) for span in rows.split(sizes)])
+        return self.readout(means)                         # [K, 2]: one row per request
+```
+
+It may return a tensor with one row per request or a list of K values of different shapes
+(a `[n_i, n_i]` distance matrix per request). If the shared call raises or its result is not K
+long, each request's call is made alone, and a request whose own call fails gets that error.
+
+- Each worker moves the module to its device and leaves its dtype alone; the hidden states are
+  the model's dtype (`rows.float()` for an fp32 probe).
+- On `mode="async"` use `await model.aattach(...)`. An `nnsight-serve` engine cannot be
+  attached to yet, and there is no detach: the module stays for the engine's life.
+- `rows="span"` needs coalescing; with `NNSIGHT_VLLM_COALESCE=0` the attach raises.
+- `sizes` is added only to a call that is parked. `model.harm_probe(stream, hook=True)` reaches
+  the module as written, so pass `sizes=[len(stream)]` yourself there.
+- The module must be an object of its own: one already in the model's tree, or holding one of
+  the model's modules, is an error. To use `lm_head` in a probe, call it from the block.
+- During generation a decode step serves one row per request, so a span module called there
+  sees one token. Pooling across generated tokens needs state of your own.
 - A shared call runs a larger batch than each request's own call would, so bf16 results can
   differ in the last bits, the same way a request's numbers depend on the batch it ran in.
 - `NNSIGHT_VLLM_COALESCE=0` in the environment before `VLLM(...)` runs every call for its

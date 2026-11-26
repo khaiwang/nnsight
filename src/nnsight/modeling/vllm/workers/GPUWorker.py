@@ -61,6 +61,10 @@ class NNsightGPUWorker(Worker):
         """
         return self.model_runner.nnsight_register(registration_id, payload, name=name)
 
+    def nnsight_attach(self, name: str, payload: bytes, rows: str | None) -> None:
+        """Add a module to this worker's model tree (``collective_rpc``)."""
+        return self.model_runner.nnsight_attach(name, payload, rows)
+
     def nnsight_clear_registered(self, registration_id: str) -> None:
         """Remove a registration from this worker (``collective_rpc``)."""
         return self.model_runner.nnsight_clear_registered(registration_id)

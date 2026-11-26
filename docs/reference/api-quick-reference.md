@@ -97,6 +97,7 @@ Available on `model` and every wrapped submodule (`model.transformer.h[0].mlp`, 
 | `model.samples` | `VLLM` | The token ids the sampler drew for the step, `[1, 1]` for one sequence. |
 | `model.logits_processor(model.lm_head, h)` | `VLLM` | The unembed on vLLM (a logit lens); `model.lm_head(h)` raises. |
 | `model.edit` | `VLLM` | `with model.edit(name=None) as (tracer, edit):` — install a block on the engine, run for *every* request it handles; values arrive on `output.saves`. `edit.clear()` / `model.clear_edits()` stop it. Needs prefix caching off (nnsight's default). |
+| `model.attach` | `VLLM` | `model.attach(name, module, rows=None)`: add a module of your own to the engine's model as `model.<name>`, once, on every worker. `rows="token"` or `"span"` lets the requests of an engine step share its calls; a span module is called as `module(rows, sizes=[...])` and returns one item per request. `await model.aattach(...)` on an async engine. See [vllm.md](../models/vllm.md#attaching-a-module-of-your-own). |
 | `edits=[...]` | `VLLM` | On `trace`/`invoke`/plain `generate`: run only the edits installed under these names, plus every unnamed edit. Omitted = all. |
 
 ## Top-level functions
