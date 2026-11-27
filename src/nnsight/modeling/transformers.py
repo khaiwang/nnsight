@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import copy
 import json
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import warnings
 
@@ -126,6 +126,22 @@ def _infer_task(module: torch.nn.Module) -> str:
         f"Could not infer a pipeline task for a pre-loaded {type(module).__name__}; "
         "pass task=... explicitly (e.g. TransformersModel(model, task='text-generation'))."
     )
+
+
+def _first_class(task: str, config: Any, build: Callable) -> torch.nn.Module:
+    """Build with the first class that takes it, of the ones ``pipeline()`` tries:
+    the task's Auto classes, then the classes ``config.architectures`` names."""
+    import transformers
+    from transformers.pipelines import check_task
+
+    named = (getattr(transformers, name, None) for name in config.architectures or ())
+    error = None
+    for cls in (*check_task(task)[1]["pt"], *filter(None, named)):
+        try:
+            return build(cls)
+        except Exception as exception:  # noqa: BLE001 - try next candidate
+            error = exception
+    raise error
 
 
 def _split_pipeline_kwargs(kwargs: dict) -> tuple[dict, dict]:
@@ -269,6 +285,7 @@ class TransformersModel(HuggingFaceModel):
         image_processor: Optional[Any] = None,
         feature_extractor: Optional[Any] = None,
         peft: Optional[str] = None,
+        autocast_adapter_dtype: bool = True,
         **kwargs: Any,
     ) -> None:
         self.task = task
@@ -277,10 +294,14 @@ class TransformersModel(HuggingFaceModel):
         self.processor = processor
         self.image_processor = image_processor
         self.feature_extractor = feature_extractor
-        # HuggingFace repo id of a PEFT adapter to apply on top of the base
+        # Repo id or local path of a PEFT adapter to apply on top of the base
         # model. Applied at load time (below); server-side it can be swapped
         # per request via _remoteable_set_env without redeploying the base.
+        # The dtype choice is part of that adapter, kept beside it so a
+        # dispatch and a swap carry it; whether it is switched on is read off
+        # the module (`adapters_enabled`).
         self.peft = peft
+        self.autocast_adapter_dtype = autocast_adapter_dtype
 
         # A sharded module called ad hoc — a logit lens — deals in one rank's
         # slices either side, where the caller is holding whole tensors.
@@ -291,6 +312,10 @@ class TransformersModel(HuggingFaceModel):
         # shard something; an ordinary model keeps the plain `Envoy` it always
         # had. A caller passing `envoys` of their own replaces it wholesale.
         from .tp.envoys import tp_envoys, wants_tensor_parallel
+
+        # A caller's `model_kwargs=` holds load kwargs like any other, so it is
+        # flattened here, before anything reads them.
+        kwargs = {**(kwargs.pop("model_kwargs", None) or {}), **kwargs}
 
         if wants_tensor_parallel(repo_id, kwargs):
             kwargs.setdefault("envoys", tp_envoys())
@@ -313,9 +338,37 @@ class TransformersModel(HuggingFaceModel):
 
     # -- loading -------------------------------------------------------------
 
-    def _preprocessor_sources(self) -> dict:
+    def _build_pipeline(self, model: Any, kwargs: dict) -> "Pipeline":
+        # The one `pipeline()` call for every load path: `model` is a repo id for
+        # the pipeline to load, or a model already built. The pipeline fetches
+        # the preprocessors either way, so it always gets the revision and every
+        # load kwarg; without them the tokenizer would come from the default
+        # cache and branch.
+        from transformers import pipeline
+
+        top_level, model_kwargs = _split_pipeline_kwargs(kwargs)
+        if isinstance(model, str):
+            # The pipeline infers every preprocessor from the repo id; only
+            # forward the ones the user explicitly supplied.
+            preprocessors = {
+                attr: getattr(self, attr)
+                for attr in _PREPROCESSORS
+                if getattr(self, attr) is not None
+            }
+        else:
+            preprocessors = self._preprocessor_sources(kwargs)
+        return pipeline(
+            self.task,
+            model=model,
+            revision=self.revision,
+            **preprocessors,
+            **top_level,
+            model_kwargs=model_kwargs,
+        )
+
+    def _preprocessor_sources(self, kwargs: dict) -> dict:
         # Feed pipeline a source for each preprocessor: the provided object, or
-        # the repo id for it to load (needed for the meta model, which has no
+        # the repo id for it to load (needed for a pre-built model, which has no
         # path to infer from). Only the preprocessors the task's pipeline actually
         # loads are sourced — passing a stray tokenizer source to a processor-based
         # (multimodal) pipeline, for instance, makes it reject the string.
@@ -331,11 +384,13 @@ class TransformersModel(HuggingFaceModel):
         # so they fetch `huggingface.co/None/...` and die. Hand them the object
         # instead; a feature extractor is a JSON config, no weights, so building
         # it costs nothing on the path that exists to avoid loading weights.
+        # It takes every load kwarg and keeps the ones it owns, as the config
+        # read does.
         if isinstance(sources.get("feature_extractor"), str):
             from transformers import AutoFeatureExtractor
 
             sources["feature_extractor"] = AutoFeatureExtractor.from_pretrained(
-                sources["feature_extractor"], revision=self.revision
+                sources["feature_extractor"], revision=self.revision, **kwargs
             )
         return sources
 
@@ -343,20 +398,20 @@ class TransformersModel(HuggingFaceModel):
         # Which of tokenizer/image_processor/feature_extractor/processor the task's
         # pipeline class loads, read from its _load_* class flags (e.g. text-
         # generation loads a tokenizer; image-text-to-text loads a processor).
+        # The task registry stores `impl` either as the class or as its dotted
+        # import path.
         from transformers.pipelines import check_task
 
-        flags = {
-            "tokenizer": "_load_tokenizer",
-            "image_processor": "_load_image_processor",
-            "feature_extractor": "_load_feature_extractor",
-            "processor": "_load_processor",
-        }
+        from ..util import from_import_path
+
         try:
             _, targeted, _ = check_task(self.task)
             impl = targeted["impl"]
+            if isinstance(impl, str):
+                impl = from_import_path(impl)
         except Exception:  # noqa: BLE001 - unknown/unset task: source them all
             return set(_PREPROCESSORS)
-        return {attr for attr, flag in flags.items() if getattr(impl, flag, False)}
+        return {attr for attr in _PREPROCESSORS if getattr(impl, f"_load_{attr}", False)}
 
     def _sync(self) -> None:
         # Adopt the pipeline's task and preprocessors. Slots the task didn't
@@ -382,6 +437,13 @@ class TransformersModel(HuggingFaceModel):
             self.tokenizer.padding_side = "left"
         elif self._is_encoder_decoder():
             self.tokenizer.padding_side = "right"
+        # Gemma answers noise without a leading <bos>, which some of its tokenizers
+        # leave off a plain string. The top-level model_type leaves out PaliGemma,
+        # whose processor puts <bos> after the image tokens. Setting the flag
+        # rebuilds the post-processor, so only a tokenizer missing <bos> gets it.
+        gemma = self.pipeline.model.config.model_type.startswith("gemma")
+        if gemma and self.tokenizer("a").input_ids[:1] != [self.tokenizer.bos_token_id]:
+            self.tokenizer.add_bos_token = True
 
     def _is_causal(self) -> bool:
         # A decoder-only generative model (GPT-2, Llava, ...) — as opposed to an
@@ -399,8 +461,8 @@ class TransformersModel(HuggingFaceModel):
         return bool(getattr(getattr(model, "config", None), "is_encoder_decoder", False))
 
     def _load_meta(self, repo_id: str, *args: Any, **kwargs: Any) -> torch.nn.Module:
-        from transformers import AutoConfig, pipeline
-        from transformers.pipelines import check_task, get_task
+        from transformers import AutoConfig
+        from transformers.pipelines import get_task
 
         from .quantization import resolve_load_kwargs
 
@@ -431,8 +493,7 @@ class TransformersModel(HuggingFaceModel):
 
         # pipeline can't from_config, so resolve the task's model classes and
         # build the meta model ourselves, then wrap it in a meta pipeline.
-        self.task = self.task or get_task(repo_id)
-        _, targeted, _ = check_task(self.task)
+        self.task = self.task or get_task(repo_id, kwargs.get("token"))
 
         # The config takes every kwarg, and keeps the ones it owns, the same split
         # from_pretrained makes (`return_unused_kwargs=True`): the implementation
@@ -453,15 +514,16 @@ class TransformersModel(HuggingFaceModel):
                 **{k: v for k, v in kwargs.items() if k != "quantization_config"},
             )
 
-        error = None
-        for auto in targeted["pt"]:
-            try:
-                model = auto.from_config(config, **arch)
-                break
-            except Exception as exception:  # noqa: BLE001 - try next candidate
-                error = exception
-        else:
-            raise error
+        # A class the checkpoint names is built by the classmethod an Auto
+        # class's `from_config` ends in, which takes no `trust_remote_code`.
+        shipped = {k: v for k, v in arch.items() if k != "trust_remote_code"}
+
+        def build(cls):
+            if hasattr(cls, "from_config"):
+                return cls.from_config(config, **arch)
+            return cls._from_config(config, **shipped)
+
+        model = _first_class(self.task, config, build)
 
         if self.peft is not None:
             # Read only the adapter's config (adapter_config.json) and graft the
@@ -470,23 +532,15 @@ class TransformersModel(HuggingFaceModel):
             # adapted model the server runs. No adapter weights are loaded here.
             peft.attach(model, self.peft, weights=False)
 
-        # The model is pre-built, so the meta pipeline only loads preprocessors;
-        # pass the pipeline-recognized arch kwargs (e.g. trust_remote_code) so a
-        # custom tokenizer loads correctly.
-        top_level, _ = _split_pipeline_kwargs(arch)
-        self.pipeline = pipeline(
-            self.task,
-            model=model,
-            device="meta",
-            **self._preprocessor_sources(),
-            **top_level,
+        # The model is pre-built, so the pipeline only loads preprocessors.
+        # Placement is this build's own, not the caller's.
+        self.pipeline = self._build_pipeline(
+            model, {**kwargs, "device": "meta", "device_map": None}
         )
         self._sync()
         return model
 
     def _load(self, repo_id: str, *args: Any, **kwargs: Any) -> torch.nn.Module:
-        from transformers import pipeline
-
         from .quantization import resolve_load_kwargs
 
         # Before the split, and before the pipeline fetches anything. This path
@@ -500,40 +554,29 @@ class TransformersModel(HuggingFaceModel):
         # and lands in `model_kwargs`, which is where from_pretrained wants it.
         kwargs = resolve_load_kwargs(kwargs)
 
-        top_level, model_kwargs = _split_pipeline_kwargs(kwargs)
-        if "config" in top_level:
+        if "config" in kwargs:
             # pipeline() reads `config` only to pick the class, never passing it
             # to from_pretrained, so load the model with it here and wrap it.
-            from transformers.pipelines import check_task, get_task
+            from transformers.pipelines import get_task
 
-            self.task = self.task or get_task(repo_id)
-            for name in ("config", "dtype", "torch_dtype", "device_map", "trust_remote_code", "token"):
+            self.task = self.task or get_task(repo_id, kwargs.get("token"))
+            top_level, model_kwargs = _split_pipeline_kwargs(kwargs)
+            # The factory arguments pipeline() itself forwards to from_pretrained.
+            for name in ("config", "dtype", "device_map", "trust_remote_code", "token"):
                 if name in top_level:
                     model_kwargs[name] = top_level[name]
-            auto = check_task(self.task)[1]["pt"][0]
-            module = auto.from_pretrained(repo_id, revision=self.revision, **model_kwargs)
-            return self._wrap(module, **top_level)
-        # The pipeline loads the model and infers every preprocessor; only
-        # forward the ones the user explicitly supplied.
-        provided = {
-            attr: getattr(self, attr)
-            for attr in _PREPROCESSORS
-            if getattr(self, attr) is not None
-        }
-        self.pipeline = pipeline(
-            self.task,
-            model=repo_id,
-            revision=self.revision,
-            **provided,
-            **top_level,
-            model_kwargs=model_kwargs,
-        )
+            module = _first_class(
+                self.task,
+                kwargs["config"],
+                lambda cls: cls.from_pretrained(
+                    repo_id, revision=self.revision, **model_kwargs
+                ),
+            )
+            return self._wrap(module, **kwargs)
+        self.pipeline = self._build_pipeline(repo_id, kwargs)
         return self._finalize_pipeline()
 
     def _wrap(self, module: torch.nn.Module, *args: Any, **kwargs: Any) -> torch.nn.Module:
-        from transformers import pipeline
-
-        top_level, _ = _split_pipeline_kwargs(kwargs)
         # The pipeline factory can't infer the task or the preprocessors from a
         # module instance, so infer the task and source the preprocessors from
         # what was passed in or the model's name_or_path (captured as
@@ -544,16 +587,23 @@ class TransformersModel(HuggingFaceModel):
         # deployment. Local inference keeps this path offline.
         if self.task is None:
             self.task = _infer_task(module)
-        self.pipeline = pipeline(
-            self.task, model=module, **self._preprocessor_sources(), **top_level
-        )
+        self.pipeline = self._build_pipeline(module, kwargs)
         return self._finalize_pipeline()
 
     def _finalize_pipeline(self) -> torch.nn.Module:
         if self.peft is not None:
+            # Read off the meta module, which `_module` still is until the swap.
+            enabled = self.adapters_enabled
             # The pipeline loaded the base weights; attach the adapter with its
             # real weights so the dispatched model runs with the adapter applied.
-            peft.attach(self.pipeline.model, self.peft)
+            peft.attach(
+                self.pipeline.model,
+                self.peft,
+                autocast_adapter_dtype=self.autocast_adapter_dtype,
+            )
+            # Switched off on the meta model: the real one starts off too.
+            if not enabled:
+                peft.set_enabled(self.pipeline.model, False)
         self._sync()
         return self.pipeline.model
 
@@ -681,7 +731,12 @@ class TransformersModel(HuggingFaceModel):
         applies it via `_remoteable_set_env` before running. The base model is
         identified by the model key; what travels here is the state layered on
         it: the PEFT adapter, when there is one, and the attention
-        implementation.
+        implementation. An adapter's on/off state travels only when it is off:
+        the server switches the adapter on for a request that names it and
+        says nothing else, so a missing key cannot mean the last caller's
+        choice. ``autocast_adapter_dtype`` does not travel: NDIF runs every
+        request under autocast in the model's dtype, where the two settings
+        give the same numbers.
 
         The attention implementation is always sent, resolved rather than as
         passed, because the server's model is shared: the previous request may
@@ -693,18 +748,25 @@ class TransformersModel(HuggingFaceModel):
         env = {"attn_implementation": self.attn_implementation}
         if self.peft is not None:
             env["peft"] = self.peft
+            if not self.adapters_enabled:
+                env["adapters_enabled"] = False
         return env
 
     def _remoteable_set_env(self, env: Optional[dict]) -> None:
         """Apply a per-request environment on the server side.
 
         The base model is identified by the model key; this applies what is
-        layered on it. See `peft.swap` for the adapter transitions. The
-        attention implementation is switched in place when it differs from
-        what the model runs: the module tree is unchanged, and the attention
-        modules pick the implementation up from the config on their next
-        forward. A request with no implementation at all came from an older
-        client, and leaves the model running whatever it was.
+        layered on it. See `peft.swap` for the adapter transitions; an attached
+        adapter is then switched on or off as the request says, and on when it
+        says nothing. The switch is applied whatever state the module is in: a
+        request body that called ``model.disable_adapters()`` switched the
+        shared module off without the server's wrapper seeing it, so the
+        module's state says nothing about what this request asked for. The
+        attention implementation is switched in place when it
+        differs from what the model runs: the module tree is unchanged, and the
+        attention modules pick the implementation up from the config on their
+        next forward. A request with no implementation at all came from an
+        older client, and leaves the model running whatever it was.
 
         The switch is checked rather than trusted: transformers only warns
         when a model cannot switch dynamically (one not written against its
@@ -718,6 +780,8 @@ class TransformersModel(HuggingFaceModel):
         """
         env = env or {}
         peft.swap(self, env.get("peft"))
+        if self.peft is not None:
+            peft.set_enabled(self._module, env.get("adapters_enabled", True))
         requested = env.get("attn_implementation")
         if requested is None or requested == self.attn_implementation:
             return
@@ -740,11 +804,28 @@ class TransformersModel(HuggingFaceModel):
         """
         return getattr(self._module.config, "_attn_implementation", None)
 
-    def load_adapter(self, peft_id: Optional[str]) -> None:
+    @property
+    def adapters_enabled(self) -> bool:
+        """Whether the attached PEFT adapter is switched on.
+
+        Read off the module, so it is what the next forward runs: ``False``
+        once `disable_adapters` switched it off, ``True`` when it is on or no
+        adapter is attached. Sent with a remote request when it is off.
+        """
+        module = self.__dict__.get("_module")
+        if self.peft is None or module is None:
+            return True
+        return peft.is_enabled(module)
+
+    def load_adapter(
+        self, peft_id: Optional[str], *, autocast_adapter_dtype: bool = True
+    ) -> None:
         """Attach a PEFT adapter — the post-hoc form of the ``peft=`` kwarg.
 
         Call again with a different id to swap adapters, or with ``None`` to
-        remove the current one (see `peft.swap` for the transitions).
+        remove the current one (see `peft.swap` for the transitions). A newly
+        loaded adapter starts enabled. A model holds one adapter, and none on
+        a tensor-parallel load.
 
         Works before dispatch: only the adapter's config is grafted onto the
         meta module, so the tree gains the adapter's modules — and remote
@@ -763,15 +844,19 @@ class TransformersModel(HuggingFaceModel):
         Args:
             peft_id: The adapter's repo id or local path, or ``None`` to
                 remove the current adapter.
+            autocast_adapter_dtype: peft's flag of that name (see
+                `peft.attach`). Local only: remotely a half-precision model
+                computes its adapter in its own dtype.
         """
         if self.dispatched:
-            peft.swap(self, peft_id)
+            peft.swap(self, peft_id, autocast_adapter_dtype)
             return
-        if peft_id == self.peft:
+        if (peft_id, autocast_adapter_dtype) == (self.peft, self.autocast_adapter_dtype):
             return
         from .mixins.meta import MetaDevice
 
         self.peft = peft_id
+        self.autocast_adapter_dtype = autocast_adapter_dtype
         # Rebuild the meta skeleton exactly as construction would have built it
         # with this adapter: `_load_meta` reads `self.peft` and grafts the
         # adapter's architecture from its config alone.
@@ -780,6 +865,49 @@ class TransformersModel(HuggingFaceModel):
         self._update(module)
         if self.pipeline is not None:
             self.pipeline.model = module
+
+    def disable_adapters(self) -> None:
+        """Switch the attached PEFT adapter off, keeping it attached.
+
+        Until `enable_adapters`, every adapter layer runs only the module it
+        holds, so the forward is the base model's bit for bit. A layer merged
+        with peft's ``merge()`` is unmerged first, which rounds (visibly in
+        half precision): for a bit-exact base, keep a copy of the weight before
+        the merge and copy it back after this call. Nothing in the module tree
+        changes: every envoy path stays valid, ``.base_layer`` and the
+        adapter's modules included, though the adapter's own modules do not run
+        while it is off. Use it for the two sides of one experiment on one
+        loaded model; `load_adapter` with ``None`` removes the adapter instead.
+
+        No ``requires_grad`` flag changes. The state is ``adapters_enabled``,
+        it survives dispatch, and it travels with remote requests. Switch
+        between traces: inside a trace body the call switches the module under
+        every invoke from that point on, and it stays switched after the trace.
+
+        This shadows ``PreTrainedModel.disable_adapters``, which refuses an
+        adapter attached by nnsight.
+
+        Raises:
+            ValueError: if no adapter is attached.
+        """
+        self._switch_adapters(False)
+
+    def enable_adapters(self) -> None:
+        """Switch the attached PEFT adapter back on; see `disable_adapters`.
+
+        Raises:
+            ValueError: if no adapter is attached.
+        """
+        self._switch_adapters(True)
+
+    def _switch_adapters(self, enabled: bool) -> None:
+        """Switch the attached adapter on or off."""
+        if self.peft is None:
+            raise ValueError(
+                "No PEFT adapter is attached, so there is none to switch: attach "
+                "one with `peft=` or `model.load_adapter(...)`."
+            )
+        peft.set_enabled(self._module, enabled)
 
     def __getstate__(self) -> dict:
         state = super().__getstate__()
