@@ -99,7 +99,8 @@ def test_decode_steps_continue_each_request(engine):
 KIMI = "yujiepan/kimi-linear-tiny-random"
 
 
-def test_kimi_states_match_hf():
+@pytest.mark.parametrize("mode", ["eager", "taps", "two_ranks"])
+def test_kimi_states_match_hf(mode):
     """Every token's state of the first delta attention layer, on a step that prefills two requests."""
     import json
     from pathlib import Path
@@ -110,7 +111,14 @@ def test_kimi_states_match_hf():
     from nnsight.modeling.vllm import VLLM
 
     # The tokenizer's code lives in the released model's repository.
-    engine = VLLM(KIMI, gpu_memory_utilization=0.15, dispatch=True, trust_remote_code=True, max_model_len=1024)
+    kwargs = {}
+    if mode == "taps":
+        kwargs = {"taps": ["model.layers.*.self_attn.kernel"]}
+    if mode == "two_ranks":
+        if torch.cuda.device_count() < 2:
+            pytest.skip("two tensor-parallel ranks need two GPUs")
+        kwargs = {"tensor_parallel_size": 2}
+    engine = VLLM(KIMI, gpu_memory_utilization=0.4, dispatch=True, trust_remote_code=True, max_model_len=1024, **kwargs)
     kernel = engine.model.layers[0].self_attn.kernel
     with engine.trace(temperature=0.0, max_tokens=2) as tracer:
         with tracer.invoke(SHORT):

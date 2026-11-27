@@ -315,7 +315,11 @@ def kimi_forward(context: None) -> Located:
         from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import KimiGatedDeltaNetAttention as Layer
     except ImportError:  # a vLLM without this layer
         return
-    yield unshimmed(Layer._forward), (Attr(Layer, "_forward"),)
+    # ``_forward`` is vLLM's eager-break wrapper. A replayed step calls the function the wrapper closes over,
+    # so that function is the kernel and its closure cell is where the layer looks it up.
+    inner = Layer._forward.__wrapped__
+    cell = next(cell for cell in Layer._forward.__closure__ if unshimmed(cell.cell_contents) is inner)
+    yield inner, (Attr(cell, "cell_contents"),)
 
 
 CATALOG: list[Spec] = [

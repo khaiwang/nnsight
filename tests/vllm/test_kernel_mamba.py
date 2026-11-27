@@ -107,11 +107,18 @@ FIRST = "state-spaces/mamba-130m-hf"
 MEDIUM = "The Eiffel Tower is located in the city of Paris and " * 6
 
 
-@pytest.fixture(scope="module")
-def first_engine():
+@pytest.fixture(scope="module", params=["one_rank", "tensor_parallel", "taps"])
+def first_engine(request):
     from nnsight.modeling.vllm import VLLM
 
-    return VLLM(FIRST, gpu_memory_utilization=0.2, dispatch=True)
+    kwargs = {}
+    if request.param == "tensor_parallel":
+        if torch.cuda.device_count() < 2:
+            pytest.skip("two tensor-parallel ranks need two GPUs")
+        kwargs = {"tensor_parallel_size": 2}
+    if request.param == "taps":
+        kwargs = {"taps": ["backbone.layers.*.mixer.kernel"]}
+    return VLLM(FIRST, gpu_memory_utilization=0.2, dispatch=True, **kwargs)
 
 
 def test_mamba1_states_match_hf(first_engine):

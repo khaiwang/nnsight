@@ -552,8 +552,16 @@ loading `allenai`-named weights raises `TypeError: list indices must be
 integers or slices, not NoneType` in the layer's conv weight loader, which
 never receives the shard id. With that loader patched in a scratch run, a tiny
 random OLMo hybrid was within 1.4% of the transformers sites at all 183
-tokens; no test is committed for it. Neither layer was run under tensor
-parallelism or `taps`.
+tokens; no test is committed for it.
+
+The Kimi test also runs on an engine built with `taps`
+(`"model.layers.*.self_attn.kernel"`) and on two tensor-parallel ranks, with
+the same 3% bound against transformers. vLLM puts its graph break on the Kimi
+layer's `_forward` itself, so the site is registered on the function under
+that break, which is what a replayed step calls. The OLMo layer with `taps`
+(`"model.layers.*.linear_attn.kernel"`) equalled the eager run exactly in the
+scratch setup. On two ranks the tiny OLMo engine started and then hung on its
+first trace, also with no site read; cause not determined.
 
 Served on the Triton/FLA prefill kernel, which vLLM selects on GPUs before
 Hopper, and on the one-token decode kernels. Not served: a prefill on the
@@ -604,7 +612,8 @@ its final state, and the other tokens of `states` are advanced from the
 entering state in fp32 (`"derived"`). A Mamba1 state is `[channels, state]`
 and `heads=` indexes the channels. On mamba-130m the states of four tokens of
 a 73-token prompt are within 0.6% (layer 0) and 2% (layer 5) of the
-transformers sites in fp32.
+transformers sites in fp32. The test runs on one rank, on two tensor-parallel
+ranks and on an engine built with `taps`.
 
 Not served: the ReplaySSM decode path and speculative decoding.
 
