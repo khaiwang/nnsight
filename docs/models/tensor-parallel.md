@@ -342,6 +342,14 @@ parallelism, but expert parallelism is still open). A style added to a plan
 They are refused because no model in the test set exercises them, not because
 they are known to be ungatherable.
 
+**Attention kernel sites are assembled across ranks.** Each rank's attention kernel holds
+`heads / tp` query heads. `attn.kernel.probs(heads=h)` ([kernel sites](../usage/kernel.md)) indexes
+the model's heads and returns the same value on every rank: each rank fills the heads it holds and
+one all-reduce sums the pieces. The read is a collective, so call it unconditionally, never inside a
+branch that could go differently on different ranks. Recurrent sites are full on every rank. MoE sites
+(`experts.kernel.expert_output(...)`) are unavailable under tensor or expert parallelism because each
+rank holds only its local shard of the experts, and requesting them raises `ValueError`.
+
 **Results differ slightly from one GPU**, because an all-reduce sums in a
 different order than one matmul. In `bfloat16` expect relative differences
 around 1e-3, growing with depth; in `float32`, around 1e-6. Greedy tokens match

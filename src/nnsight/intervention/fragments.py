@@ -74,6 +74,15 @@ class Fragments:
         that carries them, vLLM does it another way. Default: nothing to learn.
         """
 
+    def ranks(self, path: str) -> Any:
+        """The rank group that kernel calls inside the module at ``path`` are split over, or ``None``.
+
+        A [`Ranks`][nnsight.intervention.sites.Ranks], set by the kernel shim on a
+        reader that declares a layout so `Sites.read` can assemble its split axes.
+        Answered identically on every rank. Default: nothing is split.
+        """
+        return None
+
     def fragmented(self, location: str) -> bool:
         """Whether the value at ``location`` is one piece of a larger tensor.
 

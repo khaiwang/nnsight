@@ -133,6 +133,13 @@ def main() -> None:
     # Ad-hoc calls run a sharded module on whole tensors, through its own
     # hooks: a column-parallel linear (never gathered by transformers), a
     # row-parallel one (all-reduced by its post-hook) and the gathered head.
+    # Kernel sites: each rank's attention call holds a block of the heads, and
+    # a site returns all of them, indexed as on one rank.
+    with model.trace(PROMPT):
+        record("kernel_probs", layer.self_attn.kernel.probs().save())
+    with model.trace(PROMPT):
+        record("kernel_head_scores", layer.self_attn.kernel.scores(heads=[-1, 0], query=-1).save())
+
     with model.trace(PROMPT):
         mlp_in = layer.mlp.input
         down_in = layer.mlp.down_proj.input

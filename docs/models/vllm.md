@@ -49,7 +49,7 @@ VLLM(
 | `dispatch` | `True` creates the real engine during `__init__`. `False` (default) builds only a meta-tensor tree (via vLLM's `DummyModelLoader`, `device="meta"`) — no GPU memory used until the first trace. |
 | `tensor_parallel_size` | GPUs to shard across. Transparent to your interventions (see [Parallelism and architectures](vllm-parallelism.md)). |
 | `gpu_memory_utilization` | vLLM KV-cache budget (default 0.9). Lower it (e.g. 0.1) for small models / shared GPUs. |
-| `taps` | Module locations to serve with CUDA graphs **on** — `"model.layers.*.output"`, `*` one path segment. Empty (default) runs the engine eagerly, where every location is served. See [CUDA graphs with taps](#cuda-graphs-with-taps). |
+| `taps` | Module locations to serve with CUDA graphs **on** — `"model.layers.*.output"`, `*` one path segment, or a layer's [kernel sites](#attention-kernel-sites), `"model.layers.*.self_attn.attn.kernel"`. Empty (default) runs the engine eagerly, where every location is served. See [CUDA graphs with taps](#cuda-graphs-with-taps). |
 | `**vllm_kwargs` | Anything valid for `vllm.LLM` / `AsyncEngineArgs`. |
 
 The NNsight worker class is always forced internally, and so is `enforce_eager=True` unless you declare `taps` — CUDA graphs freeze the ops they replay, so an ordinary hook can't fire inside one.
@@ -389,6 +389,297 @@ model.model.norm.output
 
 Paths from `model.named_modules()` carry the root's name (`model.model.layers.0`); `model.get(...)` and `taps=` take the path without it (`model.layers.0`), and `model.taps` reports the prefixed form.
 
+## Attention kernel sites
+
+On vLLM's FlashAttention backend (the default on CUDA), the inner attention
+layer carries the [kernel sites](../usage/kernel.md) `lse`, `scores` and
+`probs`. The layer is the `Attention` module inside the model's attention
+block: `model.transformer.h[i].attn.attn` on GPT-2, `model.model.layers[i].self_attn.attn`
+on Llama-style models.
+
+```python
+attn = model.transformer.h[0].attn.attn
+with model.trace("The Eiffel Tower is in", max_tokens=3, temperature=0.0) as tracer:
+    steps = list().save()
+    for _ in tracer.iter[:3]:
+        steps.append(attn.kernel.probs().clone())
+# [tuple(p.shape) for p in steps] == [(7, 12, 7), (1, 12, 8), (1, 12, 9)]  (the prompt is 7 tokens)
+```
+
+Shapes follow vLLM's layout: there is no batch axis, and an invoke sees only
+its own request.
+
+| Site | Shape | Value |
+|------|-------|-------|
+| `lse` | `[queries, heads]` | The logsumexp the kernel computed for each query row, fp32. |
+| `scores` | `[queries, heads, keys]` | `q . k * scale` in fp32, `-inf` above the causal diagonal. |
+| `probs` | `[queries, heads, keys]` | `exp(scores - lse)`, fp32. |
+
+The query axis holds the rows the engine computed in this step: every prompt
+token on the prefill step, one token on each decode step. The key axis always
+spans every token of the request so far, read from the request's pages of the
+KV cache. `query=`, `heads=` and `key=` select along each axis with the rules of
+[kernel sites](../usage/kernel.md#sites), and a selection is applied before the
+matrix is built, so `probs(query=-1, heads=3)` costs one row.
+
+The values are rebuilt from the kernel's query rows, the cached keys and the
+kernel's own logsumexp, which the kernel returns from the same launch that
+computes the attention output. On GPT-2 layer 0 they equal the HF site's
+`probs` in bf16 to 1e-5. Deeper layers differ from HF by the bf16 rounding the
+two engines accumulate in the residual stream.
+
+A call the reconstruction does not model raises `ValueError` with the reason
+at the request: a sliding window, ALiBi, a logit soft cap, attention sinks, a
+custom mask, an fp8 KV cache, or a step vLLM computes with cascade or
+context-parallel attention (several kernel calls merged into one).
+Under tensor parallelism each rank's kernel call holds a block of the heads.
+A site still returns every head, and `heads=` indexes the model's heads: each
+rank fills the heads it holds and one sum over the ranks assembles the value
+([the reader contract](../usage/kernel.md#the-reader-contract-axes-and-their-layout-across-ranks)).
+On Qwen2.5-0.5B at `tensor_parallel_size=2`, layer 0 equals the one-rank values
+to 1e-5.
+
+On an engine built with `taps`, declare the kernel sites as a tap, by the
+attention layer's path with `.kernel` on the end:
+
+```python
+model = VLLM("gpt2", dispatch=True, taps=["transformer.h.*.attn.attn.kernel", "transformer.h.*.output"])
+```
+
+The sites are then served on every replayed step with the values of the eager
+engine (equal on GPT-2 over a prefill and two decode steps). vLLM runs its
+attention op in Python on every replay, between graph segments, so a kernel tap
+adds no graph break of its own to the attention call; it records two small
+callables around the layer. A kernel site that is not a tap raises the same
+"is not a tap on this engine" error as any other untapped location.
+
+The sites are not served on other attention backends (Triton, FlashInfer, MLA).
+
+## MLA attention kernel sites
+
+On a model with multi-head latent attention (DeepSeek-V2 and related), the
+inner attention module carries the same three sites, with the same
+`[query, heads, key]` layout and no batch axis:
+
+```python
+attn = model.model.layers[3].self_attn.mla_attn.mla_attn     # DeepSeek-V2-Lite
+with model.trace(prompt, max_tokens=3, temperature=0.0) as tracer:
+    steps = list().save()
+    for _ in tracer.iter[:3]:
+        steps.append(attn.kernel.probs(query=-1).clone())    # [heads, keys so far]
+```
+
+An MLA layer runs a step's tokens through two kernels, and the sites follow the
+one a request went through:
+
+| Step | Kernel | `scores` | `lse` | `probs` |
+|------|--------|----------|-------|---------|
+| Prefill | FlashAttention over the new tokens' expanded keys | `q . k * scale` in fp32 | the kernel's, fp32, requested in the same launch | `exp(scores - lse)` (exact reconstruction) |
+| Decode | Triton decode kernel over the request's compressed rows in the paged cache | `q . k * scale` in fp32, with the query projected into the compressed space as the kernel receives it | the kernel's, in the query dtype | fp32 softmax of the scores (`replay`), because a bf16 logsumexp is too coarse to divide by |
+
+On DeepSeek-V2-Lite the probabilities of layers 0 and 3 equal transformers'
+eager attention to within 0.07 at prefill and 0.03 at two decode steps, with
+both in bf16; against an fp32 transformers run the gap is 0.035 and 0.011.
+The sampled tokens are identical. Under `tensor_parallel_size=2` the sites
+assemble the ranks' heads and equal the one-rank engine to within 0.05 (the
+test's bound).
+
+On an engine built with `taps`, name the site as
+`"model.layers.*.self_attn.mla_attn.mla_attn.kernel"`. Layer 0 then equals the
+eager engine to 1e-5 and layer 7 to 2.5% of the largest entry, the drift between
+a replayed graph and eager execution.
+
+Not served: a prefill that continues cached or earlier-chunk context (prefix
+caching or chunked prefill), which vLLM computes as several kernel calls merged
+by logsumexp; the other MLA backends (FlashMLA, FlashInfer, CUTLASS, sparse
+variants); and a quantized cache.
+
+## Recurrent kernel sites
+
+On Qwen3-Next and Qwen3.5 models, a gated delta rule layer
+(`layers[i].linear_attn`) carries the recurrent
+[kernel sites](../usage/kernel.md#recurrent-states-of-a-chunked-kernel)
+`chunk_states` and `states`:
+
+```python
+attn = model.language_model.model.layers[0].linear_attn      # Qwen3.5-0.8B
+with model.trace(prompt, max_tokens=3, temperature=0.0) as tracer:
+    steps = list().save()
+    for _ in tracer.iter[:3]:
+        steps.append(attn.kernel.chunk_states().clone())
+# a 145-token prompt: [tuple(s.shape) for s in steps] == [(4, 16, 128, 128), (2, 16, 128, 128), (2, 16, 128, 128)]
+```
+
+| Site | Shape | Value |
+|------|-------|-------|
+| `chunk_states` | `[chunks, heads, K, V]` | On a prefill step: the state entering each 64-token chunk of the request's tokens in this step, then its final state. On a decode step: the state before the token and the state after it. |
+| `states` | `[tokens, heads, K, V]` | The state after each token of the step. A token that ends a chunk is the kernel's own state; one inside a chunk is advanced from the chunk's entering state in fp32. |
+
+There is no batch axis, and an invoke reads only its own request. `chunks=`,
+`tokens=` and `heads=` select as on a transformers model, and a selection is
+applied before anything is computed.
+
+vLLM's kernels and its state cache hold a state as `[heads, V, K]`. The sites
+serve `[heads, K, V]`, the layout of the transformers sites, so the same code
+reads both. On Qwen3.5-0.8B layer 0, the chunk states and the per-token states
+of a 145-token prompt equal the transformers sites to 0.8% of the largest entry;
+vLLM's kernel runs in bf16 and transformers' reference in fp32.
+
+Each request's state lives in a slot of the layer's state cache, and a decode
+step advances the slot in place. The state a decode step serves as entering is
+therefore the state the previous step served as final, bit for bit.
+
+Under tensor parallelism each rank's layer holds `num_v_heads // tp_size`
+value heads and a state of that many heads. The sites assemble the ranks'
+blocks, so `heads=` indexes the model's heads. On Qwen3.5-0.8B at
+`tensor_parallel_size=2`, layer 0 equals the one-rank engine exactly on a
+prefill step and to 3e-5 on a later decode step.
+
+On an engine built with `taps`, name the site as
+`"language_model.model.layers.*.linear_attn.kernel"`. Layer 0 then equals the
+eager engine exactly. Deeper layers differ by a few percent of the largest
+entry because the layer outputs feeding them already differ between a graph
+replay and eager execution (layer 0's output differs by 2e-3 with identical
+kernel inputs and outputs; cause not determined).
+
+The Kimi delta attention layer of Kimi Linear (`model.layers[i].self_attn` on
+its delta attention layers) and the gated delta rule layer of OLMo hybrid
+(`model.layers[i].linear_attn`) serve the same two sites. Both layers run every
+request of a step that prefills through their chunk kernel. On a tiny random
+Kimi Linear, every token's state of a 145-token prompt is within 0.7% of the
+transformers sites in fp32. vLLM 0.33 cannot load an OLMo hybrid checkpoint:
+loading `allenai`-named weights raises `TypeError: list indices must be
+integers or slices, not NoneType` in the layer's conv weight loader, which
+never receives the shard id. With that loader patched in a scratch run, a tiny
+random OLMo hybrid was within 1.4% of the transformers sites at all 183
+tokens; no test is committed for it.
+
+The Kimi test also runs on an engine built with `taps`
+(`"model.layers.*.self_attn.kernel"`) and on two tensor-parallel ranks, with
+the same 3% bound against transformers. vLLM puts its graph break on the Kimi
+layer's `_forward` itself, so the site is registered on the function under
+that break, which is what a replayed step calls. The OLMo layer with `taps`
+(`"model.layers.*.linear_attn.kernel"`) equalled the eager run exactly in the
+scratch setup. On two ranks the tiny OLMo engine started and then hung on its
+first trace, also with no site read; cause not determined.
+
+Served on the Triton/FLA prefill kernel, which vLLM selects on GPUs before
+Hopper, and on the one-token decode kernels. Not served: a prefill on the
+FlashInfer kernel (vLLM's choice on Hopper), which returns no chunk states;
+speculative decoding, where draft tokens advance states that are later
+discarded; and the Kimi and OLMo gated delta rule layers.
+
+
+## Mamba2 kernel sites
+
+A Mamba2 layer (`MambaMixer2`: Mamba2, and the state-space layers of
+Nemotron-H, Jamba, Granite hybrid, Falcon-H1 and Zamba2) carries the same two
+recurrent sites:
+
+```python
+mixer = model.backbone.layers[0].mixer                        # mamba2-130m
+with model.trace(prompt, max_tokens=1, temperature=0.0):
+    chunks = mixer.kernel.chunk_states().clone().save()       # [chunks + 1, heads, head_dim, state]
+    states = mixer.kernel.states(tokens=[0, 100, -1]).clone().save()
+```
+
+| Site | Shape | Value |
+|------|-------|-------|
+| `chunk_states` | `[chunks + 1, heads, head_dim, state]` | On a prefill step: the state entering each chunk the kernel cut for this request, then its final state. On a decode step: the state before the token and the state after it. |
+| `states` | `[tokens, heads, head_dim, state]` | The state after each token of the step. A token that ends a chunk is the kernel's own state; one inside a chunk is advanced from the chunk's entering state in fp32 with the layer's recurrence. |
+
+vLLM packs a step's prefilling requests into one strip and cuts chunks at every
+multiple of the model's chunk size along the strip and at every request
+boundary. A request that is not first in the strip therefore has a shorter
+first chunk, and which request is first is vLLM's choice. `chunk_states`
+follows that cut; `states` does not depend on it.
+
+The state layout is the transformers layout, so no axes are swapped. On
+mamba2-130m, the states after 8 tokens of a 391-token prompt equal the
+transformers sites to 0.3% of the largest entry at layer 0 and 2.5% at layer 5,
+with vLLM in bf16 and transformers in fp32. Under `tensor_parallel_size=2` the
+sites assemble the ranks' heads and equal the one-rank engine to within 2%
+(the test's bound).
+
+On an engine built with `taps`, name the site as
+`"backbone.layers.*.mixer.kernel"`. Layers 0 and 7 then equal the eager engine
+exactly.
+
+A Mamba1 layer (Mamba, Jamba) is served at the same location. Its prefill
+kernel is one fused scan that writes only each request's final state, so a
+request is one chunk: `chunk_states` is the state the request entered with and
+its final state, and the other tokens of `states` are advanced from the
+entering state in fp32 (`"derived"`). A Mamba1 state is `[channels, state]`
+and `heads=` indexes the channels. On mamba-130m the states of four tokens of
+a 73-token prompt are within 0.6% (layer 0) and 2% (layer 5) of the
+transformers sites in fp32. The test runs on one rank, on two tensor-parallel
+ranks and on an engine built with `taps`.
+
+Not served: the ReplaySSM decode path and speculative decoding.
+
+## Expert kernel sites
+
+On a model whose MoE layers run vLLM's Triton experts kernel, the MoE module
+(`MoERunner`, for example `layers[i].mlp.experts` on DeepSeek-V2) carries the
+[expert kernel sites](../usage/kernel.md) of the transformers reader:
+
+```python
+mlp = model.model.layers[3].mlp                         # DeepSeek-V2-Lite
+with model.trace(prompt, max_tokens=1, temperature=0.0):
+    logits = mlp.gate.output[0].save()                               # [tokens, experts]
+    act = mlp.experts.kernel.expert_activation().clone().save()      # [tokens, top_k, intermediate]
+    out = mlp.experts.kernel.expert_output(tokens=-1).save()         # [top_k, hidden]
+    one = mlp.experts.kernel.expert_output(expert=7).save()          # [tokens, hidden], 0 where not routed
+```
+
+| Site | Shape | Value |
+|------|-------|-------|
+| `expert_input` | `[tokens, top_k, hidden]` | The layer's input row. |
+| `expert_activation` | `[tokens, top_k, width]` | The kernel's own activation rows, copied before vLLM reuses the workspace. |
+| `expert_output` | `[tokens, top_k, hidden]` | The down projection before the routing weight. The kernel multiplies by the routing weight in the same pass and never stores this row, so the selected rows are recomputed from the activation rows and the expert's weight (provenance `replay`). |
+
+There is no batch axis, and an invoke reads only its own tokens of the step.
+
+Slot `k` is the token's `k`-th routed expert in the kernel's order. vLLM ranks
+experts on bf16 scores, so for two experts with nearly equal scores the order
+can differ from a top-k taken over `gate.output` in fp32. `expert=` selects by
+expert id and does not depend on the order.
+
+The MoE module's `.output` is the weighted sum of the routed rows plus the
+shared experts when the model has them. On DeepSeek-V2-Lite layer 3, the
+activation and output rows equal an fp32 computation from the layer's weights
+to 1% of each row's largest entry, and the weighted sum plus the shared experts
+equals the module output to 0.7% per token.
+
+Under expert parallelism (`tensor_parallel_size=2, enable_expert_parallel=True`)
+each rank holds a share of the experts and runs only the pairs routed to them.
+The sites sum the ranks, so a read returns every routed pair's row, as on one
+rank. On DeepSeek-V2-Lite layer 3 with two ranks, the three sites equal the
+one-rank engine to 2% of the largest entry, which is also how much the layer's
+input differs between the two engines.
+
+Under tensor parallelism without expert parallelism each rank holds every
+expert, cut to one block of its intermediate width. The activation rows are
+joined along the width, and `expert_output` is the sum of the ranks' partial
+down projections. On DeepSeek-V2-Lite layer 3 with two ranks the three sites
+equal the one-rank engine to within 5% of the largest entry (the test's bound).
+
+`expert_activation` also takes `width=` to select intermediate units, on one
+rank and across ranks: `kernel.expert_activation(tokens=-1, width=[3, 700])`.
+
+On an engine built with `taps`, name the site as
+`"model.layers.*.mlp.experts.kernel"`. vLLM records the MoE layer into the CUDA
+graph whole, so a replayed step would run no Python there. For a MoE module
+with a kernel tap, nnsight keeps the module's body in Python as a graph break
+of its own and copies its output into a buffer the next graph segment reads.
+Module locations inside that body (the gate, for example) are then served on
+every step when they are taps. Layer 1 equals the eager engine; at layer 7 the
+rows differ by a few percent, and one pair of 30 was routed to another expert,
+because a replayed graph rounds differently from eager execution upstream.
+
+Not served: other experts kernels (FlashInfer, batched Triton, quantized
+weights or activations) and LoRA.
+
 ## CUDA graphs with taps
 
 vLLM's decode throughput comes largely from CUDA-graph replay, which `enforce_eager=True` gives up because a replayed graph runs no Python and so no hooks. `taps` keeps the graphs: the locations you name are recorded *into* the graph as breaks (vLLM's `VLLM_USE_BREAKABLE_CUDAGRAPH`), and at each break the interleaver's normal handoff runs on every replay. Everything else is unchanged — the same trace syntax, per-request scoping, `tracer.iter`, `model.logits` / `model.samples`.
@@ -493,7 +784,11 @@ False ...}`.
 - **No batch-sharded sampling** — each tensor-parallel rank then samples only the requests it owns, and a block's logits are scoped to the whole batch. `VLLM(..., enable_batch_sharded_sampling=True)` raises `NotImplementedError` before anything is built.
 - **No data parallelism** — vLLM answers the call that brings a request's saved values back from its first engine only, so `VLLM(..., data_parallel_size=N)` with `N > 1` raises `NotImplementedError` before anything is built. Use `tensor_parallel_size`, or one `VLLM` per GPU.
 - **No backward / gradients, and no source tracing inside a fused CUDA kernel** — the kernel's
-  inputs and outputs are locations; its interior is not Python.
+  inputs and outputs are locations; its interior is not Python. Of the [kernel sites](../usage/kernel.md),
+  only attention on the FlashAttention backend is served ([Attention kernel sites](#attention-kernel-sites)).
+  Recurrent and MoE sites such as `mixer.kernel.states(...)` are unavailable: vLLM's Mamba, gated-delta
+  and fused-MoE layers execute through vLLM's own custom ops and state caches, so requesting `.kernel`
+  there ends in `OutOfOrderError` because the location is never reached.
 - **No `.scan()`.** It propagates shapes by running the model's own forward under a fake-tensor
   mode, and there is no forward on this side to run. `model.scan(...)` raises
   `NotImplementedError: scan is unavailable on vLLM: ... Trace a prompt and read the shapes off the

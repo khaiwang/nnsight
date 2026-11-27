@@ -44,6 +44,7 @@ from ..batching import VLLMBatcher
 from ..collect import dumps_compact
 from ..fragments import VLLMFragments
 from ..interleaver import VLLMInterleaver
+from ..kernel import register_kernels
 from ..vllm import VLLM
 
 if TYPE_CHECKING:
@@ -456,7 +457,7 @@ class Requests:
             # A barrier unwinds with a ValueError and names no module location.
             and isinstance(error, OutOfOrderError)
             and requester.provider not in taps
-            and requester.provider.rsplit(".", 1)[-1] in ("input", "output", "skip")
+            and requester.provider.rsplit(".", 1)[-1] in ("input", "output", "skip", "kernel")
         ):
             # Outside the taps nothing is reached however many steps ran, so the
             # loop's shape is beside the point: this is the whole reason.
@@ -517,6 +518,8 @@ class NNsightGPUModelRunner(GPUModelRunner):
             interleaver=VLLMInterleaver(taps, fragments=VLLMFragments()),
         )
         self.nnsight_model.tokenizer = cached_tokenizer_from_config(self.model_config)
+        # Kernel sites on the attention backend this worker runs (see `..kernel`).
+        register_kernels()
 
         interleaver = self.nnsight_model.interleaver
         # No envoy: the spans come from the scheduler rather than from an invoke,
