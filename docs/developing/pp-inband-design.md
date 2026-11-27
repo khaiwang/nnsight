@@ -24,12 +24,11 @@ The engine already moves data between stages in both directions, sequenced
 with its steps. Forward, `GPUWorker.execute_model` sends the tensor
 dictionary a stage returns to the next stage (`isend_tensor_dict`: pickled
 metadata on the CPU group, each tensor GPU to GPU), under both the
-multiprocess and the Ray executor. Backward, the sampled token the last stage
-produces at step `s` reaches the first stage before its step `s+1`: under
-async scheduling by a broadcast on the pipeline group right after sampling
-(`gpu_model_runner.py`, `_pp_broadcast_prev_sampled_token_ids`), and under
-sync scheduling through the scheduler, in the next step's `SchedulerOutput`. A block's cross-stage values have exactly these two
-shapes, so they take the same carriers.
+multiprocess and the Ray executor. Backward, vLLM returns the sampled token to the earlier
+stages after every step (`PPHandler` in vLLM 0.33; a broadcast in
+`sample_tokens` before that), and `sample_tokens` runs on every stage at that
+point. A block's cross-stage values have exactly these two shapes, so they
+take the same places.
 
 ## The carriers
 
@@ -52,36 +51,48 @@ buffers, which would fail on a key it does not expect. A value from stage 0
 reaches stage 2 by being re-sent from stage 1 with stage 1's own.
 
 **Backward.** After the last stage samples, its outbox holds what it served
-this step. Under async scheduling every stage runs `sample_tokens`, so the
+this step. vLLM calls `sample_tokens` on every stage for every step that ran
+a forward, in step order, under both schedulers and both executors, so the
 last stage broadcasts the outbox and the `ROUND` marks on the pipeline group
-(`broadcast_tensor_dict`) right after vLLM's own token broadcast, and the
-earlier stages receive it at the same point. The broadcast carries the
-entries of the stages between as well, which the stages before them lack,
-but not the first stage's, which every later stage already got forward.
-A stage relays a copy taken when the entry arrived, since its own copy of
-the block may change the value it was handed in place. Under sync
-scheduling the sampled tokens reach the earlier stages through the scheduler,
-so the last stage puts the same entries, on the host, on its
-`ModelRunnerOutput`; `NNsightScheduler`
-(`pp_scheduler.py`) keeps them by request and attaches them to the request's
-next `SchedulerOutput`, which every stage reads before its forward. A request
-that finishes has no next step, and the scheduler drops what it left.
-Whether async scheduling is on is settled inside vLLM's config after the
-engine's arguments are read, and it differs by executor and release (vLLM
-0.19 picked its compiled-graph Ray executor by itself inside a Ray placement
-group and turned async scheduling off there; 0.27's Ray executor keeps it
-on, and nnsight refuses the compiled-graph one), so nnsight does
-not install a scheduler class directly: `scheduler_cls` replaces whatever
-vLLM would pick, its `AsyncScheduler` included. Every pipeline engine gets
-`pp_scheduler.pipeline_scheduler`, which the engine core calls once with the
-finished config, and which builds vLLM's own `AsyncScheduler` when async
-scheduling is on and `NNsightScheduler` when it is off.
-`tests/vllm/pp/test_engine_scheduler.py` builds each case and checks the
-scheduler the engine core holds.
+(`broadcast_tensor_dict`) at the end of its `sample_tokens`, and the earlier
+stages receive it at the end of theirs. The broadcast carries the entries of
+the stages between as well, which the stages before them lack, but not the
+first stage's, which every later stage already got forward. A stage relays a
+copy taken when the entry arrived, since its own copy of the block may change
+the value it was handed in place.
+
+On vLLM 0.33's V2 runner this exchange is what orders the steps. The engine
+keeps `pp_size + 1` steps in flight under async scheduling, and vLLM's own
+sampled-token broadcast runs on a side stream and is read `pp_size` steps
+later, so by itself an earlier stage could start a later step before the last
+stage has sampled this one. The earlier stage waits in the exchange until the
+last stage has sampled, so it holds a step's values before its next forward.
+The cost is that the steps in flight no longer overlap (see "Costs and
+limits").
+
+Up to vLLM 0.27 the branch also carried the backward entries through the
+scheduler (`pp_scheduler.py`), for an executor whose earlier stages never ran
+`sample_tokens`. vLLM 0.33 has no such executor, and that route is removed.
 
 **Filing.** Each stage files a forward payload's entries from stages before
 it and a backward payload's entries from stages after it, so a value is filed
 once whichever way it came, and re-sends forward what it filed forward.
+
+## A module several stages hold
+
+vLLM builds some modules on more than one stage and calls them on one: the
+token embedding of a model with tied embeddings is built on the first and the
+last stage, for the head's weight, and called on the first. The exchange of
+held modules at load cannot say which stage calls such a module, so it has no
+owner. `pp.shared_modules` names them: real on several stages, with nothing
+under them that one stage owns alone (a module with an owned module under it
+is a container around the split, which every stage runs for its own part).
+The stage whose forward calls a shared module serves it and sends the value
+like one of its own; a stage that holds the module without calling it hands
+its worker the value that was filed (`PPInterleaver._take_shared`).
+
+`tracer.result`, and the outputs of the containers around the split, are each
+stage's own and are not sent.
 
 ## What a waiting worker does
 
@@ -119,6 +130,8 @@ from waiting are gone with the waiting.
 
 ## What it was checked against
 
+Measured before the port to vLLM 0.33, on vLLM 0.19 and 0.27; not rerun since.
+
 A probe runner (`scratchpad/inband/`) added a tensor of a shape that changed
 every step and a small dictionary to the forward transfer and broadcast a
 step-stamped payload after sampling, on Qwen2.5-0.5B at PP=2:
@@ -140,6 +153,8 @@ request table), and the PP=2 engine behavior suite, 26 of 26, on the
 multiprocess executor.
 
 ## Measured against push at 7B
+
+Measured before the port to vLLM 0.33, on vLLM 0.19 and 0.27; not rerun since.
 
 Measured at `ee4cd475`, where every in-band PP engine ran vLLM's sync
 `Scheduler` in place of `AsyncScheduler` (the default scheduler was replaced
@@ -192,10 +207,6 @@ cost of the transport itself, see "Costs and limits".
   divides by the TP size across the TP ranks and gathers it on the other
   side. Each TP rank's copy of a block is served the same whole value, so the
   gather reconstructs it.
-- The backward payload under sync scheduling crosses the engine-core process
-  on the host, pickled, as the sampled tokens do there. A large value read on
-  the last stage and used again on an earlier one pays that; under async
-  scheduling it moves GPU to GPU.
 - A payload lives for one step on the sending side (outbox) and until taken
   or the request ends on the receiving side (inbox). Nothing arrives outside
   a step, so nothing outlives its request.

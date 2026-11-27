@@ -117,11 +117,25 @@ class TestPPModuleMap:
 
 
 class TestIsPPMissing:
-    def test_detects_the_stub_by_class_name(self):
-        # Checked by name so nnsight needs no import of the vLLM internal
-        # class; a stand-in with the same name must count.
-        PPMissingLayer = type("PPMissingLayer", (nn.Identity,), {})
+    def test_detects_vllms_stub_and_a_shell_over_one(self):
+        from vllm.model_executor.models.utils import PPMissingLayer
+
+        from nnsight.modeling.vllm.pp_envoys import RemoteShell
+
         assert is_pp_missing(PPMissingLayer())
+        assert is_pp_missing(RemoteShell(None, "model.head", 1, 0))
+
+    def test_a_module_several_stages_hold_whole_is_shared(self):
+        from nnsight.modeling.vllm.pp import derive_owners, shared_modules
+
+        per_stage = [["decoder", "decoder.token_table", "decoder.blocks", "decoder.blocks.0"], ["decoder", "decoder.token_table", "decoder.blocks", "decoder.blocks.1", "output_projection"]]
+        owners = derive_owners(per_stage)
+        # The table is real on both stages with nothing under it; the containers around the split are not shared.
+        assert shared_modules(per_stage, owners) == {"decoder.token_table"}
+        m = PPModuleMap(2, root_path="engine")
+        m.set_derived_owners(owners, shared_modules(per_stage, owners))
+        assert m.is_shared("engine.decoder.token_table.output") and not m.is_shared("engine.decoder.blocks.0.output")
+        assert m.get_owning_rank("engine.decoder.token_table.output") is None
 
     def test_real_modules_are_not_stubs(self):
         assert not is_pp_missing(nn.Identity())

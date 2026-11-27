@@ -77,7 +77,8 @@ class RemoteShell(PPMissingLayer):
         from ...intervention.interleaver import Mediator
 
         try:
-            req = Mediator.current(provider).pp_req
+            mediator = Mediator.current(provider)
+            req = mediator.interleaver.workers[mediator].req
         except ValueError:
             # No block is running: asked at load, or from a plain call.
             req = None
@@ -109,8 +110,8 @@ class RemoteShell(PPMissingLayer):
         state = self._fetch(f"{self._pp_path}{STATE_MARK}")
         return torch.func.functional_call(meta, state, args, kwargs)
 
-    def _nnsight_parameter(self, name: str) -> torch.Tensor:
-        """``param(name)``: the parameter fetched from the owner's module."""
+    def fetch_parameter(self, name: str) -> torch.Tensor:
+        """The parameter ``name``, fetched from the owner's module (see `PPInterleaver.parameter`)."""
         meta = self.__dict__.get("_pp_meta")
         if meta is None or (name not in meta._parameters and name not in meta._buffers):
             raise AttributeError(f"{self._pp_path!r} has no parameter or buffer named {name!r}")

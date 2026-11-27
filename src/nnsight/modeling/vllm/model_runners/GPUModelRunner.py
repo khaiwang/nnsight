@@ -157,8 +157,14 @@ class Requests:
             is nothing else to let go of.
     """
 
-    def __init__(self, release: Optional[Callable[[str], None]] = None) -> None:
+    def __init__(
+        self,
+        release: Optional[Callable[[str], None]] = None,
+        enrol: Optional[Callable[[Any, str, int], None]] = None,
+    ) -> None:
         self.release = release
+        #: Told each worker of a new request, with its request id and its place among the request's workers.
+        self.enrol = enrol
         self.requests: dict[str, Request] = {}
         self.templates: dict[str, Any] = {}
         self.names: dict[str, str | None] = {}
@@ -241,7 +247,6 @@ class Requests:
                     for name, value in template.lcls.items()
                 }
                 copy = Mediator(template.code, template.glbls, scope)
-                copy.source = template.source
                 copy.presaved = set(template.presaved)
                 request.copies[registration_id] = copy
             if "nnsight_mediator" in extra_args:
@@ -253,14 +258,9 @@ class Requests:
             # same on every pipeline stage, since every stage builds the same
             # copies in the same order, so the stages can name a worker to each
             # other.
-            for ordinal, mediator in enumerate(request.workers()):
-                mediator.pp_req = data.req_id
-                mediator.pp_ordinal = ordinal
-                mediator.pp_announced = False
-                mediator.pp_step = 0
-                # Whether this stage holds something of the worker's that only
-                # it can report: a cache observed here.
-                mediator.pp_reports = False
+            if self.enrol is not None:
+                for ordinal, mediator in enumerate(request.workers()):
+                    self.enrol(mediator, data.req_id, ordinal)
 
     def refuse_chunked(self, batch: "InputBatch") -> None:
         """Give a request whose prompt this step only partly prefills its error, not a worker.
@@ -557,6 +557,8 @@ class NNsightGPUModelRunner(GPUModelRunner):
             # and this rank answers the peers' parameter and state requests
             # from its own modules.
             graft_children(self.nnsight_model, meta_model, interleaver.local_rank, interleaver.link, interleaver.device)
+            # Every location starts with the root envoy's path.
+            interleaver.module_map.root_path = self.nnsight_model.path
             interleaver.link.resolver = resolver(self.get_model(), interleaver.module_map.root_path)
             self._replicate_heads(interleaver, meta_model)
 
@@ -568,7 +570,10 @@ class NNsightGPUModelRunner(GPUModelRunner):
         # every other request shares.
         interleaver.defer_exceptions = True
 
-        self.nnsight_requests = Requests(release=interleaver.finished if self.nnsight_pp else None)
+        self.nnsight_requests = Requests(
+            release=interleaver.finished if self.nnsight_pp else None,
+            enrol=interleaver.enrol if self.nnsight_pp else None,
+        )
         self._pipeline_scheduled: list = []
         self._pipeline_sent: dict = {}
         # The map that resolves a serialized request's persistent ids (the interleaver,
@@ -597,7 +602,7 @@ class NNsightGPUModelRunner(GPUModelRunner):
         """
         import torch.distributed as dist
 
-        from ..pp import PPModuleMap, build_meta_tree, derive_owners, is_pp_missing, pipeline_columns, stub_rank_gated_modules
+        from ..pp import PPModuleMap, build_meta_tree, derive_owners, is_pp_missing, pipeline_columns, shared_modules, stub_rank_gated_modules
         from ..pp_envoys import install_shells
         from ..pp_interleaver import PPInterleaver
         from ..pp_transport import Link
@@ -616,11 +621,13 @@ class NNsightGPUModelRunner(GPUModelRunner):
         per_stage: list = [None] * world
         dist.all_gather_object(per_stage, held, group=pp_group.cpu_group)
         owners = derive_owners(per_stage)
-        # Built on every rank, produced on the last: the exchange cannot place them.
-        for structural in ("logits", "samples", "logits_processor"):
-            owners.setdefault(structural, world - 1)
+        shared = shared_modules(per_stage, owners)
+        # The sampler's two locations are nnsight's own, on the root, and are
+        # produced where the model samples: the last stage.
+        for location in (VLLM.logits, VLLM.samples):
+            owners.setdefault(location.key, world - 1)
         module_map = PPModuleMap(world)
-        module_map.set_derived_owners(owners)
+        module_map.set_derived_owners(owners, shared)
 
         # The stages of one engine replica form a pipeline group per
         # tensor-parallel column. Each rank knows its own; gathering them
@@ -680,7 +687,7 @@ class NNsightGPUModelRunner(GPUModelRunner):
         anyway means pickling every saved tensor a second time and carrying
         it to the engine.
         """
-        return not self.nnsight_pp or get_pp_group().is_last_rank or bool(mediator.pp_reports)
+        return not self.nnsight_pp or get_pp_group().is_last_rank or self.nnsight_model.interleaver.workers[mediator].reports
 
     def _parked_on_later_stage(self, mediator: Any) -> bool:
         """Whether a finished request's worker is parked on a later stage's
@@ -696,7 +703,10 @@ class NNsightGPUModelRunner(GPUModelRunner):
             return False
         interleaver = self.nnsight_model.interleaver
         owner = interleaver.owner(pending.provider)
-        return owner is not None and owner > interleaver.local_rank
+        if owner is None:
+            # A module this stage holds too, which another stage's forward calls.
+            return interleaver.module_map.is_shared(pending.provider)
+        return owner > interleaver.local_rank
 
     def _pipeline_workers(self, request_ids: Any) -> list:
         """The workers of the named requests that this engine carries."""
@@ -709,8 +719,9 @@ class NNsightGPUModelRunner(GPUModelRunner):
         interleaver = self.nnsight_model.interleaver
         for request in self.nnsight_requests.requests.values():
             for mediator in request.workers():
-                if mediator.exception is not None and not mediator.pp_announced:
-                    mediator.pp_announced = True
+                worker = interleaver.workers[mediator]
+                if mediator.exception is not None and not worker.announced:
+                    worker.announced = True
                     interleaver.failed(
                         mediator,
                         f"the block failed on stage {interleaver.local_rank}: "
@@ -1063,6 +1074,14 @@ class NNsightGPUModelRunner(GPUModelRunner):
     def nnsight_clear_registered(self, registration_id: str) -> None:
         """Stop running a block and drop what it has not handed back."""
         self.nnsight_requests.unregister(registration_id)
+
+    def nnsight_pipeline_filed(self) -> int:
+        """How many workers this stage still holds other stages' values or errors for.
+
+        A leak gauge for pipeline parallelism: zero once every request has finished.
+        """
+        interleaver = self.nnsight_model.interleaver
+        return len(interleaver.inbox) + len(interleaver.errors)
 
     def nnsight_request_count(self) -> int:
         """How many requests' workers this runner still tracks.

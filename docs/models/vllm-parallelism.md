@@ -44,6 +44,8 @@ top1 = logits.argmax(-1).item()
 | call the module, `model.model.norm(h)` | the module's state is fetched from the owning stage for the request and the call runs here on it; a module that computes from a buffer outside its state dict has to be called on its owner |
 | `.source` of the module | fails to resolve any operation |
 
+A module vLLM builds on more than one stage and calls on one (the token embedding of a model with tied embeddings, built on the first and the last stage) reads the same from every stage: the stage whose forward calls it sends its value. `tracer.result` is each stage's own.
+
 Saved values are collected from the last stage, whose copy of the block is served every value and runs to the end; a cache observes the modules of the stage it runs on, and the stages' caches are unioned. A read of another stage's module is a copy taken as the block read it, carried with the step's activations to the stages after the owner and, from the last stage, back to the earlier ones after sampling; a value the owner did not serve in a step raises on the reader at once. A value saved on the stage that holds its module is a view of the engine's buffer, as on one GPU, so the "clone what you keep" rule of [vllm.md](vllm.md) applies to it and `NNSIGHT_VLLM_CLONE_READS` covers every stage alike. `tracer.iter` steps every stage together.
 
 The ordering rule is the one a single GPU has: a read parks the block until the model reaches the location, so a location the forward passes meanwhile is out of order afterwards. On a later stage this means a read of a later stage's value parks the block until that stage runs, and the local layers passed in the meantime cannot be read after it. Read the local values first.

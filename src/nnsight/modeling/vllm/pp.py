@@ -12,7 +12,7 @@ layer names.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import torch.nn as nn
 
@@ -84,14 +84,28 @@ def stub_rank_gated_modules(local: nn.Module, meta: nn.Module) -> list[str]:
 
 
 def is_pp_missing(module: nn.Module) -> bool:
-    """Check whether *module* is a vLLM ``PPMissingLayer`` stub.
+    """Whether *module* stands for a layer this stage does not hold (vLLM's ``PPMissingLayer``, or a shell over one)."""
+    from vllm.model_executor.models.utils import PPMissingLayer
 
-    vLLM replaces layers that don't belong to a PP rank with
-    ``PPMissingLayer`` (a subclass of ``nn.Identity``). Checked by class name
-    so we don't need a hard import of the vLLM internal class (which may move
-    between versions).
+    return isinstance(module, PPMissingLayer)
+
+
+def shared_modules(per_stage: list, owners: dict) -> set:
+    """The module paths several stages hold whole: real on more than one stage, with nothing under them one stage owns alone.
+
+    vLLM builds such a module on every stage that needs its weights and calls
+    it on one of them (the token embedding of a model with tied embeddings is
+    built on the first and the last stage, and called on the first). Which
+    stage calls it is not visible in the structure, so the stage whose forward
+    does serves it to the others (see `PPInterleaver`). A module real on
+    several stages that has an owned module under it is a container around the
+    split, which every stage runs for its own part.
     """
-    return type(module).__name__ == "PPMissingLayer"
+    counts: dict = {}
+    for held in per_stage:
+        for name in held:
+            counts[name] = counts.get(name, 0) + 1
+    return {name for name, count in counts.items() if count > 1 and not any(owned.startswith(f"{name}.") for owned in owners)}
 
 
 class PPModuleMap:
@@ -113,9 +127,6 @@ class PPModuleMap:
             component instead of guessing.
     """
 
-    # Trailing eproperty keys to strip before resolving a module path.
-    _EPROPERTY_KEYS = ("output", "input", "inputs")
-
     def __init__(self, pp_world_size: int, root_path: str = "model"):
         self.pp_world_size = pp_world_size
         self.root_path = root_path
@@ -125,11 +136,14 @@ class PPModuleMap:
         # model load completes), in which case every path resolves to ``None``
         # — the safe treated-as-local default.
         self._derived_owners: dict[str, int] = {}
+        # Paths several stages hold whole (see `shared_modules`).
+        self._shared: dict[str, bool] = {}
+        self._shared_memo: dict[str, bool] = {}
         # Ownership is constant for the model's life; memoize per lookup path
         # (``get_owning_rank`` runs on every cross-stage access).
         self._owner_memo: dict[str, Optional[int]] = {}
 
-    def set_derived_owners(self, owners: dict) -> None:
+    def set_derived_owners(self, owners: dict, shared: Iterable[str] = ()) -> None:
         """Install the per-module owning-rank map derived from the meta exchange.
 
         Keys are vLLM ``named_modules()`` names (e.g. ``"model.layers.5"``,
@@ -138,22 +152,27 @@ class PPModuleMap:
         """
         self._derived_owners = dict(owners)
         self._owner_memo = {}
-
-    def _strip_eproperty(self, parts: list) -> list:
-        """Drop a trailing eproperty key (``output``/``input``/``inputs``)."""
-        if parts and parts[-1] in self._EPROPERTY_KEYS:
-            return parts[:-1]
-        return parts
+        self._shared = dict.fromkeys(shared, True)
+        self._shared_memo = {}
 
     def _derived_owner(self, parts: list) -> Optional[int]:
-        """Resolve ownership for the longest owned ancestor of ``parts``.
+        return self._nearest(parts, self._derived_owners)
+
+    def is_shared(self, module_path: str) -> bool:
+        """Whether *module_path* is, or is under, a module several stages hold whole."""
+        if module_path not in self._shared_memo:
+            self._shared_memo[module_path] = bool(self._nearest(module_path.split("."), self._shared))
+        return self._shared_memo[module_path]
+
+    def _nearest(self, parts: list, table: dict) -> Any:
+        """``table``'s entry for the longest ancestor of ``parts`` it has.
 
         A submodule (``…layers.5.mlp``) inherits the stage of its nearest
         owned ancestor (``…layers.5``). The root-stripped form (envoy path →
         raw ``named_modules`` name) is tried first — the common case; the
         as-given form second (raw-name callers, e.g. error paths and tests).
         """
-        if not self._derived_owners:
+        if not table:
             return None
         stripped = parts[1:] if parts and parts[0] == self.root_path else None
         for candidate in (stripped, parts):
@@ -161,9 +180,9 @@ class PPModuleMap:
                 continue
             walk = list(candidate)
             while walk:
-                owner = self._derived_owners.get(".".join(walk))
-                if owner is not None:
-                    return owner
+                found = table.get(".".join(walk))
+                if found is not None:
+                    return found
                 walk.pop()
         return None
 
@@ -175,9 +194,7 @@ class PPModuleMap:
         descriptive error at pull time.
         """
         if module_path not in self._owner_memo:
-            self._owner_memo[module_path] = self._derived_owner(
-                self._strip_eproperty(module_path.split("."))
-            )
+            self._owner_memo[module_path] = self._derived_owner(module_path.split("."))
         return self._owner_memo[module_path]
 
     def is_local(self, module_path: str, local_rank: int) -> bool:

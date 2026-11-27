@@ -12,6 +12,7 @@ from nnsight.modeling.vllm.pp_envoys import (
     graft_children,
     install_shells,
 )
+from nnsight.modeling.vllm.pp_interleaver import PPInterleaver
 from nnsight.modeling.vllm.pp_transport import Kept
 
 
@@ -43,7 +44,7 @@ def stage0():
     module_map.set_derived_owners({"blocks.0": 0, "blocks.1": 1, "norm": 1})
     local, meta = Stack(), Stack()
     installed = install_shells(local, meta, module_map, 0)
-    model = NNsight(local)
+    model = NNsight(local, interleaver=PPInterleaver(module_map, None, 0, torch.device("cpu")))
     graft_children(model, meta, 0)
     return model, installed
 
@@ -72,7 +73,7 @@ def test_a_call_runs_the_owner_state_here_without_touching_the_meta_copy():
     local, meta = Stack(), Stack()
     link = _FakeLink(state_of=owner.norm)
     install_shells(local, meta, module_map, 0, link)
-    model = NNsight(local)
+    model = NNsight(local, interleaver=PPInterleaver(module_map, None, 0, torch.device("cpu")))
     graft_children(model, meta, 0, link)
     copy = model.norm._module._pp_meta
     copy.weight.output_dim = 0  # what vLLM stamps on a sharded parameter
@@ -95,7 +96,7 @@ def test_param_after_a_call_still_carries_the_sharding_stamp():
     meta.norm.weight.output_dim = 0
     link = _FakeLink(state_of=owner.norm)
     install_shells(local, meta, module_map, 0, link)
-    model = NNsight(local)
+    model = NNsight(local, interleaver=PPInterleaver(module_map, None, 0, torch.device("cpu")))
     graft_children(model, meta, 0, link)
     model.norm(torch.randn(2, 4))
     pulled = model.norm.param("weight")
@@ -108,7 +109,7 @@ def test_a_fetch_outside_any_request_is_kept_for_the_engine():
     local, meta = Stack(), Stack()
     link = _FakeLink()
     install_shells(local, meta, module_map, 0, link)
-    model = NNsight(local)
+    model = NNsight(local, interleaver=PPInterleaver(module_map, None, 0, torch.device("cpu")))
     graft_children(model, meta, 0, link)
     model.norm.param("weight")
     model.norm.param("weight")
@@ -144,7 +145,7 @@ def test_a_head_kept_by_its_state_answers_param_under_its_own_names():
     local, meta = PackedStack(), PackedStack()
     link = _FakeLink(state_of=owner.output_projection)
     install_shells(local, meta, module_map, 0, link)
-    model = NNsight(local)
+    model = NNsight(local, interleaver=PPInterleaver(module_map, None, 0, torch.device("cpu")))
     graft_children(model, meta, 0, link)
 
     model.output_projection._module._fetch("model.output_projection.state")  # as at load
@@ -190,7 +191,7 @@ def test_param_pulls_from_the_owner_while_the_attribute_still_raises():
     local, meta = Stack(), Stack()
     link = _FakeLink()
     install_shells(local, meta, module_map, 0, link)
-    model = NNsight(local)
+    model = NNsight(local, interleaver=PPInterleaver(module_map, None, 0, torch.device("cpu")))
     graft_children(model, meta, 0, link)
     assert torch.equal(model.norm.param("weight"), torch.full((4,), 3.0))
     assert torch.equal(model.blocks[1].proj.param("bias"), torch.full((4,), 3.0))

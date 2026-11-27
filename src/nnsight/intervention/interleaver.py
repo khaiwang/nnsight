@@ -39,10 +39,11 @@ location the model already ran past raises [`OutOfOrderError`][nnsight.intervent
 from __future__ import annotations
 
 import enum
-import sys
 import warnings
 import weakref
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
+
+import torch
 
 from greenlet import GreenletExit, getcurrent, greenlet
 
@@ -193,9 +194,6 @@ class Mediator:
         # block's own mutations; otherwise (a one-shot trace/invoke body) it execs
         # against the stored scope so push_result can read back the values it saved.
         self.code = code
-        # The block's source, when it was rebuilt from one (see __setstate__);
-        # a runtime that reads the block ahead of running it parses this.
-        self.source: Optional[str] = None
         self.glbls = glbls
         self.lcls = Scope(lcls, {} if shared is None else shared, glbls)
         self.copy = copy
@@ -215,9 +213,6 @@ class Mediator:
         # [`Pending`][nnsight.intervention.interleaver.Pending]), or None when it
         # isn't parked.
         self.pending: Pending | None = None
-        # The block line the pending request was made from (see `event`), or
-        # None when it was not made from the block's own frame.
-        self.line: Optional[int] = None
         # Which occurrence of a location the worker is currently asking for (or
         # None when relaxed). See `handle` for how it is matched.
         self.iteration: int | None = 0
@@ -294,7 +289,6 @@ class Mediator:
             filename,
         )
         self.__init__(compile(source, filename, "exec"), glbls, lcls, copy=state["copy"])
-        self.source = source
         self.presaved = state["presaved"]
 
     @classmethod
@@ -337,7 +331,6 @@ class Mediator:
         # the flushed swap relaxes a pinned step (see `handle`), and this request
         # is the pinned one.
         occurrence = mediator.wanted(location)
-        mediator.line = cls._line(mediator)
         mediator.flush()
         return getcurrent().parent.switch(Pending(event, location, occurrence, *rest))
 
@@ -352,14 +345,6 @@ class Mediator:
         waiting, self.transform = self.transform, None
         if waiting is not None:
             getcurrent().parent.switch(Pending(Event.SWAP, waiting.location, waiting.occurrence, waiting.fn()))
-
-    @staticmethod
-    def _line(mediator: "Mediator") -> Optional[int]:
-        """The line of the block the worker is executing, read off its frame."""
-        frame = sys._getframe(2)
-        while frame is not None and frame.f_code is not mediator.code:
-            frame = frame.f_back
-        return None if frame is None else frame.f_lineno
 
     def occurrence(self, location: str) -> int:
         """How many times the model has reached ``location`` since this worker started."""
@@ -518,20 +503,17 @@ class Mediator:
             # "unpinned"; None already is).
             if self.iteration:
                 self.iteration = None
-            # The switch below parks the worker on its next request, which
-            # replaces `line`; this request's is what `served` is told.
-            line = self.line
             if pending.event is Event.VALUE:  # serve this worker only its rows
                 served = value if batcher is None else batcher.narrow(value, self.batch_group)
                 # What the worker is about to get, seen before it gets it: the
                 # block may change it in place before it parks again.
                 if self.interleaver is not None:
-                    self.interleaver.serving(self, provider, served, line=line)
+                    self.interleaver.serving(self, provider, served)
                 self.pending = self.switch(served)
                 # The worker has what it asked for and has parked again; a
                 # runtime whose ranks each run this block hears about both.
                 if self.interleaver is not None:
-                    self.interleaver.served(self, provider, served, line=line)
+                    self.interleaver.served(self, provider, served)
             elif pending.event is Event.SWAP:  # splice its edit back into the batch
                 if batcher is None:
                     value = pending.value
@@ -539,7 +521,7 @@ class Mediator:
                     value = batcher.widen(value, self.batch_group, pending.value)
                 self.pending = self.switch()
                 if self.interleaver is not None:
-                    self.interleaver.served(self, provider, None, event=Event.SWAP, line=line)
+                    self.interleaver.served(self, provider, None, event=Event.SWAP)
             elif pending.event is Event.SKIP:  # gather per-invoke replacements
                 if batcher is None:
                     value = pending.value
@@ -549,7 +531,7 @@ class Mediator:
                     )
                 self.pending = self.switch()
                 if self.interleaver is not None:
-                    self.interleaver.served(self, provider, None, event=Event.SKIP, line=line)
+                    self.interleaver.served(self, provider, None, event=Event.SKIP)
             pending = self.pending
         return value
 
@@ -898,19 +880,28 @@ class Interleaver:
                 del stopped
         return value
 
+    def parameter(self, envoy: Any, name: str) -> torch.Tensor:
+        """The parameter or buffer ``name`` of ``envoy``'s module, for ``Envoy.param``.
+
+        The module's own tensor here. A runtime whose ranks each hold part of
+        the model overrides this to fetch one it does not hold.
+        """
+        value = getattr(envoy._module, name, None)
+        if not isinstance(value, torch.Tensor):
+            raise AttributeError(f"{envoy.path!r} has no parameter or buffer named {name!r}")
+        return value
+
     def serving(
         self,
         mediator: Mediator,
         provider: str,
         value: Any,
-        line: Optional[int] = None,
     ) -> None:
         """A worker's read at ``provider`` is about to be served ``value``.
 
         Called by [`Mediator.handle`][nnsight.intervention.interleaver.Mediator.handle]
         right before the worker is resumed with ``value`` (narrowed to its rows,
-        whole across a sharded model); ``line`` is the block line the read was
-        made from, when known. This is the moment ``value`` is what the worker
+        whole across a sharded model). This is the moment ``value`` is what the worker
         asked for: once resumed, the block may modify it in place before it
         parks again, so a runtime that carries the value to other ranks copies
         it here. Nothing here in the base.
@@ -923,7 +914,6 @@ class Interleaver:
         value: Any,
         selected: Optional[tuple] = None,
         event: Event = Event.VALUE,
-        line: Optional[int] = None,
     ) -> None:
         """A worker's request at ``provider`` was just served and it has parked again.
 
@@ -933,8 +923,7 @@ class Interleaver:
         ``mediator.pending`` already the worker's next request; and by `handle`
         after a cache subscribed to ``provider`` recorded ``value`` (``selected``
         is that cache's ``(path, slot)``). A read's ``value`` is what the consumer
-        got: narrowed to the worker's rows, whole across a sharded model; ``line``
-        is the block line the served request was made from, when known. Nothing
+        got: narrowed to the worker's rows, whole across a sharded model. Nothing
         here; a runtime whose ranks each run the same block against a part of the
         model overrides this to carry values to the ranks that do not hold this
         location and to answer what the worker asks of them next.

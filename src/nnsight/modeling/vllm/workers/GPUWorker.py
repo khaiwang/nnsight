@@ -52,6 +52,10 @@ class NNsightGPUWorker(Worker):
         """How many requests this worker's runner still tracks, via ``collective_rpc``."""
         return self.model_runner.nnsight_request_count()
 
+    def nnsight_pipeline_filed(self) -> int:
+        """How many workers this stage still holds other stages' values for, via ``collective_rpc``."""
+        return self.model_runner.nnsight_pipeline_filed()
+
     def nnsight_register(
         self, registration_id: str, payload: bytes, name: str | None = None
     ) -> None:

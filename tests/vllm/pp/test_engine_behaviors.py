@@ -59,6 +59,33 @@ def test_cross_stage_write_changes_logits(pp2_engine):
     assert not torch.equal(clean, zeroed)
 
 
+def test_a_module_two_stages_hold_is_read_from_the_stage_that_calls_it(pp2_engine):
+    """The model ties its embeddings, so vLLM builds the token embedding on the
+    first and the last stage and calls it on the first. The last stage's copy
+    of the block, the one collected, is handed the first stage's value."""
+    model = pp2_engine
+    with model.trace(PROMPT, temperature=0.0, max_tokens=1):
+        embedded = model.model.embed_tokens.output.save()
+        late = _layer(model, LATE).output[0].save()
+        logits = model.logits.save()
+    assert isinstance(embedded, torch.Tensor) and embedded.shape == late.shape
+    assert model.tokenizer.decode(logits[-1].argmax(dim=-1)).strip() == "Paris"
+
+
+def test_a_raise_after_a_cross_stage_write_ends_only_its_request(pp2_engine):
+    """A block that writes the last stage's samples and then raises fails its own
+    request with its own error, on every stage, and the engine serves the next trace."""
+    model = pp2_engine
+    with pytest.raises(Exception) as info:
+        with model.trace(PROMPT, temperature=0.0, max_tokens=3):
+            model.samples = model.samples
+            raise ValueError("raised after the write")
+    assert "raised after the write" in str(info.value), info.value
+    with model.trace(PROMPT, temperature=0.0, max_tokens=1):
+        logits = model.logits.save()
+    assert model.tokenizer.decode(logits[-1].argmax(dim=-1)).strip() == "Paris"
+
+
 def test_local_read_after_a_downstream_force_fails_fast(pp2_engine):
     """Forcing a downstream layer parks the upstream rank's worker through the
     forward, so its later read of an upstream layer is out of order there. The
@@ -346,6 +373,20 @@ def test_every_rank_releases_finished_workers(pp2_engine):
     assert len(hs) == 3
     counts = model.vllm_entrypoint.llm_engine.collective_rpc("nnsight_request_count")
     assert len(counts) == 2 and all(count == 0 for count in counts), counts
+
+
+def test_tracer_result_is_not_filed_on_the_other_stages(pp2_engine):
+    """``tracer.result`` is each stage's own: it is not sent to the others, where
+    it would arrive after the request was retired and stay for the engine's life."""
+    model = pp2_engine
+    with model.trace(PROMPT, temperature=0.0, max_tokens=2) as tracer:
+        result = tracer.result.save()
+    assert result is not None
+    # A further request carries anything a stage still had to send.
+    with model.trace(PROMPT, temperature=0.0, max_tokens=1):
+        model.logits.save()
+    filed = model.vllm_entrypoint.llm_engine.collective_rpc("nnsight_pipeline_filed")
+    assert len(filed) == 2 and all(count == 0 for count in filed), filed
 
 
 # ---------------------------------------------------------------------------
