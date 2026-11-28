@@ -31,7 +31,33 @@ logits = model.logits_processor(model.lm_head, model.model.norm(h))   # [1, voca
 top1 = logits.argmax(-1).item()
 ```
 
-`pipeline_parallel_size > 1` is a different split and is not supported. Each stage holds part of the trunk while the block is written against the whole tree and sent to every worker, so a stage that does not hold a module cannot resolve it: the engine builds, and every trace on it ends in `RuntimeError: UnknownPersistentIdError: Module:model.model.layers.12.self_attn`, naming a layer on the other stage. Shard with `tensor_parallel_size`.
+## Pipeline parallelism
+
+`pipeline_parallel_size > 1` splits the trunk by layers: each stage holds a contiguous run of layers, the first stage the embeddings, the last stage the final norm, the head and the sampler. The block is written against the whole tree and every stage runs all of it. What a stage does with a module it does not hold:
+
+| use of a module on another stage | what happens |
+|---|---|
+| read `.output`, `.input`, `.inputs` | the block waits for the value; the owning stage sends it as its own copy of the block reads it |
+| write `.output`, `.input`, `.skip()` | absorbed here, applied on the owning stage |
+| `module.param("weight")` | the head's parameters are on every stage from load, under whatever names the checkpoint gives them; any other parameter is fetched from the owning stage when a request first reads it and dropped when that request finishes |
+| `module.weight` (the attribute) | raises, naming the owning stage; use `param("weight")` |
+| call the module, `model.model.norm(h)` | the module's state is fetched from the owning stage for the request and the call runs here on it; a module that computes from a buffer outside its state dict has to be called on its owner |
+| `.source` of the module | fails to resolve any operation |
+
+A module vLLM builds on more than one stage and calls on one (the token embedding of a model with tied embeddings, built on the first and the last stage) reads the same from every stage: the stage whose forward calls it sends its value. `tracer.result` is each stage's own.
+
+Saved values are collected from the last stage, whose copy of the block is served every value and runs to the end; a cache observes the modules of the stage it runs on, and the stages' caches are unioned. A read of another stage's module is a copy taken as the block read it, carried with the step's activations to the stages after the owner and, from the last stage, back to the earlier ones after sampling; a value the owner did not serve in a step raises on the reader at once. A value saved on the stage that holds its module is a view of the engine's buffer, as on one GPU, so the "clone what you keep" rule of [vllm.md](vllm.md) applies to it and `NNSIGHT_VLLM_CLONE_READS` covers every stage alike. `tracer.iter` steps every stage together.
+
+The ordering rule is the one a single GPU has: a read parks the block until the model reaches the location, so a location the forward passes meanwhile is out of order afterwards. On a later stage this means a read of a later stage's value parks the block until that stage runs, and the local layers passed in the meantime cannot be read after it. Read the local values first.
+
+```python
+model = VLLM("Qwen/Qwen2.5-14B-Instruct", pipeline_parallel_size=2)
+with model.trace(prompt):
+    early = model.model.layers[3].output[0]                 # stage 0's layer, local there
+    normed = model.model.norm.output[0]                     # stage 1's, sent where needed
+    logits = normed[-1] @ model.lm_head.param("weight").T   # the head, fetched to stage 0
+    top1 = logits.argmax(-1).save()
+```
 
 ## Mixture-of-experts models and expert parallelism
 

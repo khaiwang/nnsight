@@ -1104,3 +1104,44 @@ class TestRenameWildcard:
         model = Envoy(Wrapped(), rename={"model.transformer": "backbone"}, envoys={"backbone": Block})
         assert "backbone" not in model.__dict__
         assert type(model.transformer) is Envoy
+
+
+class TestParameters:
+    def test_param_is_the_parameter_itself(self, envoy, module):
+        assert envoy.head.param("weight") is module.head.weight
+        assert envoy.layers[1].mlp.fc.param("bias") is module.layers[1].mlp.fc.bias
+
+    def test_the_attribute_still_reaches_the_parameter(self, envoy, module):
+        assert envoy.head.weight is module.head.weight
+
+    def test_the_interleaver_answers_parameter_reads(self):
+        from nnsight.intervention.interleaver import Interleaver
+
+        class Fetching(Interleaver):
+            def parameter(self, envoy, name):
+                return torch.full((2,), 7.0)
+
+        envoy = Envoy(nn.Sequential(nn.ReLU()), interleaver=Fetching())
+        assert torch.equal(envoy[0].param("weight"), torch.full((2,), 7.0))
+
+    def test_a_module_without_the_parameter_raises(self, envoy):
+        with pytest.raises(AttributeError, match="act"):
+            envoy.layers[0].mlp.act.param("weight")
+
+    def test_inside_a_trace_it_computes_like_the_module(self):
+        class Net(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.body = nn.Linear(8, 8)
+                self.head = nn.Linear(8, 4)
+
+            def forward(self, x):
+                return self.head(torch.relu(self.body(x)))
+
+        model = nnsight.NNsight(Net())
+        x = torch.randn(2, 8)
+        with model.trace(x):
+            hidden = model.body.output
+            by_call = model.head(hidden).save()
+            by_weight = (hidden @ model.head.param("weight").T + model.head.param("bias")).save()
+        assert torch.allclose(by_call, by_weight)

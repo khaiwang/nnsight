@@ -19,6 +19,84 @@ from typing import Any
 from vllm.v1.engine.llm_engine import LLMEngine
 
 
+def merge_saves(reports: list[dict]) -> dict:
+    """One dict of saved values from the ranks' reports, the last rank's first.
+
+    The last rank's value of a name wins: under pipeline parallelism every
+    value the block reads reaches the last stage, whose copy of the block
+    runs to the end holding all of them, and under tensor parallelism the
+    ranks hold equal values. A cache is the one thing that stays where it was
+    made, each stage's holding what its own modules produced, so a name bound
+    to a cache is the union of the ranks' entries by module path.
+    """
+    from ....intervention.cache import Cache, CacheView
+
+    def cache_of(value: Any) -> Cache | None:
+        # tracer.cache() hands the block a CacheView over its Cache.
+        if isinstance(value, CacheView):
+            return value._cache
+        return value if isinstance(value, Cache) else None
+
+    ordered = list(reversed(reports))
+    merged: dict[str, Any] = {}
+    for report in ordered:
+        for name, value in report.items():
+            merged.setdefault(name, value)
+    for name, value in merged.items():
+        cache = cache_of(value)
+        if cache is None:
+            continue
+        for report in ordered:
+            other = cache_of(report.get(name))
+            if other is not None and other is not cache:
+                for path, entries in other.entries.items():
+                    cache.entries.setdefault(path, entries)
+    return merged
+
+
+def merge_collected(payloads: list) -> dict:
+    """Combine the replies to ``collect_nnsight`` into one entry per request.
+
+    The first tensor-parallel rank of each pipeline stage replies, and the
+    other ranks reply ``None``: without pipeline parallelism that is one
+    reply, which this hands back as it is. Under it, the last stage's reply
+    carries every value the block read, and an earlier stage's carries what
+    only it holds, a cache that observed its own modules (see the runner's
+    ``_reports_saves``). Saves and registered values are taken the last
+    stage's first (`merge_saves`), and so is the error, a real one over a stop.
+    """
+    replies = [pickle.loads(payload) for payload in payloads or () if payload is not None]
+    if len(replies) == 1:
+        return replies[0]
+    merged: dict[str, dict] = {}
+    reports: dict[str, dict] = {}
+    for reply in replies:
+        for request_id, entry in reply.items():
+            into = merged.setdefault(
+                request_id,
+                {"saves": {}, "error": None, "registered": {}, "sequences": {}},
+            )
+            report = reports.setdefault(request_id, {"saves": [], "registered": [], "errors": [], "sequences": {}})
+            report["saves"].append(entry.get("saves") or {})
+            report["registered"].append(entry.get("registered") or {})
+            report["errors"].append(entry.get("error"))
+            for index, sequence in (entry.get("sequences") or {}).items():
+                into["sequences"].setdefault(index, {"saves": {}, "registered": {}})
+                per_index = report["sequences"].setdefault(index, {"saves": [], "registered": []})
+                per_index["saves"].append(sequence.get("saves") or {})
+                per_index["registered"].append(sequence.get("registered") or {})
+    for request_id, report in reports.items():
+        into = merged[request_id]
+        errors = [error for error in reversed(report["errors"]) if error is not None]
+        into["error"] = next((error for error in errors if not error["is_control_flow"]), errors[0] if errors else None)
+        into["saves"] = merge_saves(report["saves"])
+        into["registered"] = merge_saves(report["registered"])
+        for index, per_index in report["sequences"].items():
+            into["sequences"][index]["saves"] = merge_saves(per_index["saves"])
+            into["sequences"][index]["registered"] = merge_saves(per_index["registered"])
+    return merged
+
+
 def attach(output: Any, entry: dict) -> None:
     """Put a request's collected values on its output.
 
@@ -58,12 +136,13 @@ async def acollect(engine: Any, request_id: str, output: Any = None) -> dict | N
     and needs in order to serve ``tracer.result``; without one this is simply the
     call that winds the request's workers up and frees what they held. Every rank
     is called, since each has workers to wind up, but only the first
-    tensor-parallel rank replies with values; the rest reply ``None``.
+    tensor-parallel rank of each pipeline stage replies with values; the rest
+    reply ``None`` (see `merge_collected`).
     """
     ids = [request_id]
     args = (ids, ids) if output is None else (ids, ids, pickle.dumps({request_id: output}))
     replies = await engine.collective_rpc("collect_nnsight", args=args)
-    return pickle.loads(next(reply for reply in replies if reply is not None)).get(request_id)
+    return merge_collected(replies).get(request_id)
 
 
 class NNsightLLMEngine(LLMEngine):
@@ -92,8 +171,7 @@ class NNsightLLMEngine(LLMEngine):
         replies = self.engine_core.collective_rpc(
             "collect_nnsight", args=(finished, finished, pickle.dumps(by_id))
         )
-        # Only the first tensor-parallel rank replies with values (see `acollect`).
-        collected = pickle.loads(next(reply for reply in replies if reply is not None))
+        collected = merge_collected(replies)
         for output in outputs:
             entry = collected.get(output.request_id)
             if entry is not None:

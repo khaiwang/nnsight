@@ -43,6 +43,8 @@ import warnings
 import weakref
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+import torch
+
 from greenlet import GreenletExit, getcurrent, greenlet
 
 from ..tracing.util import Scope
@@ -503,13 +505,23 @@ class Mediator:
                 self.iteration = None
             if pending.event is Event.VALUE:  # serve this worker only its rows
                 served = value if batcher is None else batcher.narrow(value, self.batch_group)
+                # What the worker is about to get, seen before it gets it: the
+                # block may change it in place before it parks again.
+                if self.interleaver is not None:
+                    self.interleaver.serving(self, provider, served)
                 self.pending = self.switch(served)
+                # The worker has what it asked for and has parked again; a
+                # runtime whose ranks each run this block hears about both.
+                if self.interleaver is not None:
+                    self.interleaver.served(self, provider, served)
             elif pending.event is Event.SWAP:  # splice its edit back into the batch
                 if batcher is None:
                     value = pending.value
                 else:
                     value = batcher.widen(value, self.batch_group, pending.value)
                 self.pending = self.switch()
+                if self.interleaver is not None:
+                    self.interleaver.served(self, provider, None, event=Event.SWAP)
             elif pending.event is Event.SKIP:  # gather per-invoke replacements
                 if batcher is None:
                     value = pending.value
@@ -518,6 +530,8 @@ class Mediator:
                         value, self.batch_group, pending.value
                     )
                 self.pending = self.switch()
+                if self.interleaver is not None:
+                    self.interleaver.served(self, provider, None, event=Event.SKIP)
             pending = self.pending
         return value
 
@@ -848,6 +862,7 @@ class Interleaver:
                 else self.batcher.narrow(value, mediator.batch_group)
             )
             cache.observe_selected(selected, served)
+            self.served(mediator, provider, served, selected=selected)
 
         # Back to the piece the model's own forward expects, carrying whatever the
         # workers left behind — so an edit to the assembled tensor reaches the
@@ -864,6 +879,55 @@ class Interleaver:
                 # unwound, and their activations, alive until a gc collection.
                 del stopped
         return value
+
+    def parameter(self, envoy: Any, name: str) -> torch.Tensor:
+        """The parameter or buffer ``name`` of ``envoy``'s module, for ``Envoy.param``.
+
+        The module's own tensor here. A runtime whose ranks each hold part of
+        the model overrides this to fetch one it does not hold.
+        """
+        value = getattr(envoy._module, name, None)
+        if not isinstance(value, torch.Tensor):
+            raise AttributeError(f"{envoy.path!r} has no parameter or buffer named {name!r}")
+        return value
+
+    def serving(
+        self,
+        mediator: Mediator,
+        provider: str,
+        value: Any,
+    ) -> None:
+        """A worker's read at ``provider`` is about to be served ``value``.
+
+        Called by [`Mediator.handle`][nnsight.intervention.interleaver.Mediator.handle]
+        right before the worker is resumed with ``value`` (narrowed to its rows,
+        whole across a sharded model). This is the moment ``value`` is what the worker
+        asked for: once resumed, the block may modify it in place before it
+        parks again, so a runtime that carries the value to other ranks copies
+        it here. Nothing here in the base.
+        """
+
+    def served(
+        self,
+        mediator: Mediator,
+        provider: str,
+        value: Any,
+        selected: Optional[tuple] = None,
+        event: Event = Event.VALUE,
+    ) -> None:
+        """A worker's request at ``provider`` was just served and it has parked again.
+
+        Called by [`Mediator.handle`][nnsight.intervention.interleaver.Mediator.handle]
+        after each of a worker's events at a visit (``event`` says which: a read
+        got ``value``, a swap or skip got nothing and ``value`` is ``None``), with
+        ``mediator.pending`` already the worker's next request; and by `handle`
+        after a cache subscribed to ``provider`` recorded ``value`` (``selected``
+        is that cache's ``(path, slot)``). A read's ``value`` is what the consumer
+        got: narrowed to the worker's rows, whole across a sharded model. Nothing
+        here; a runtime whose ranks each run the same block against a part of the
+        model overrides this to carry values to the ranks that do not hold this
+        location and to answer what the worker asks of them next.
+        """
 
     def check_dangling_mediators(self) -> None:
         """Surface any worker still parked after the run.
